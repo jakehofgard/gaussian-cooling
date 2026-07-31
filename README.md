@@ -18,6 +18,8 @@ preconditioning experiments. Preconditioner quality is measured by
 | `gaussian_cooling_algs.py` | Reusable ULMC and Gaussian-cooling algorithms. |
 | `experiment_transformed_gaussian.py` | Transformed-Gaussian benchmark with an exact reference. |
 | `experiment_truncated_phi4.py` | Translation-invariant lattice $\phi^4$ benchmark and diagnostics. |
+| `Dockerfile.runpod` | Reproducible NVIDIA container for RunPod deployment. |
+| `RUNPOD.md` | Cost-conscious setup and scaling guide for a RunPod H100. |
 
 No datasets are required. Every plot is saved as a separate vector PDF.
 
@@ -36,6 +38,10 @@ For an NVIDIA GPU, install CUDA-enabled JAX using the
 [official JAX instructions](https://docs.jax.dev/en/latest/installation.html)
 before installing the requirements. The algorithms use one GPU; plotting,
 dense metrics, and autocorrelation analysis remain CPU-side.
+
+For an H100, follow the [RunPod setup and scaling guide](RUNPOD.md). It covers
+the network-volume layout, persistent JAX cache, GPU verification, production
+commands, and shutdown safeguards.
 
 ## Run
 
@@ -70,8 +76,18 @@ automatically.
 
 ### Transformed Gaussian
 
-The target is $\pi_B=\mathcal{N}(0,B^{-1})$, where $B$ has Haar-random
-eigenvectors and geometrically spaced eigenvalues. The experiment compares:
+The base target is $z\sim\mathcal{N}(0,\Sigma_0)$, where $\Sigma_0$ has
+Haar-random eigenvectors and eigenvalues in $[1,10]$. The coordinate change
+$z=B^{1/2}x$ produces
+
+```math
+x\sim\mathcal{N}\!\left(
+0,\,B^{-1/2}\Sigma_0B^{-1/2}
+\right).
+```
+
+The matrix $B$ has independent Haar-random eigenvectors and geometrically
+spaced eigenvalues in $[1/\kappa(B),1]$. The experiment compares:
 
 - Gaussian cooling;
 - $K$-stage empirical preconditioning without cooling;

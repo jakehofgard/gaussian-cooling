@@ -1,12 +1,16 @@
 """Experiment comparing covariance preconditioners on transformed Gaussians.
 
-The target density is
+The base target and transformed target are
 
-    pi_B(x) propto exp(-U(B^{1/2} x)),    U(z) = ||z||^2 / 2.
+    z ~ N(0, Sigma_0),
+    pi_B(x) propto exp(-U(B^{1/2} x)).
 
-Consequently ``pi_B = N(0, B^{-1})``.  The eigenvalues of ``B`` are
-geometrically spaced in ``[1 / kappa, 1]`` and its eigenvectors are Haar
-orthogonal. Gaussian cooling is compared at an equal ULMC budget with:
+The well-conditioned base covariance ``Sigma_0`` has Haar eigenvectors and
+geometrically spaced eigenvalues in ``[1, kappa_0]``, with ``kappa_0=10`` by
+default. Since ``z = B^{1/2} x``, the transformed covariance is
+``B^{-1/2} Sigma_0 B^{-1/2}``, not ``B^{-1}``. The eigenvalues of ``B`` are
+geometrically spaced in ``[1 / kappa_B, 1]`` and its eigenvectors are also
+Haar orthogonal. Gaussian cooling is compared at an equal ULMC budget with:
 
 * one unpreconditioned ULMC run of length ``steps * stages``; and
 * staged covariance adaptation on the uncooled target.
@@ -88,10 +92,14 @@ MARKERS = {
 
 @dataclass(frozen=True)
 class GaussianTarget:
-    """A fixed transformed Gaussian and its analytic covariance."""
+    """A well-conditioned Gaussian after a fixed linear coordinate change."""
 
+    base_covariance: np.ndarray
+    transformation: np.ndarray
     precision: Array
     covariance: np.ndarray
+    smoothness_bound: float
+    strong_convexity_bound: float
     potential: PotentialFn
     gradient: PotentialFn
 
@@ -99,6 +107,8 @@ class GaussianTarget:
 @dataclass
 class ExperimentResult:
     kappas: np.ndarray
+    target_conditions: np.ndarray
+    base_condition_number: float
     relative_conditions: dict[str, np.ndarray]
     convergence_conditions: dict[str, np.ndarray]
     exact_cooling_oracle: np.ndarray
@@ -113,27 +123,110 @@ def haar_orthogonal(rng: np.random.Generator, dimension: int) -> np.ndarray:
     return q * signs
 
 
+def matrix_condition_number(matrix: np.ndarray) -> float:
+    """Return the spectral condition number of a symmetric positive matrix."""
+
+    eigenvalues = np.linalg.eigvalsh(0.5 * (matrix + matrix.T))
+    if eigenvalues[0] <= 0.0:
+        raise ValueError("Expected a symmetric positive-definite matrix.")
+    return float(eigenvalues[-1] / eigenvalues[0])
+
+
+def make_well_conditioned_covariance(
+    dimension: int,
+    condition_number: float,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Draw ``V D V.T`` with ``D`` geometrically spaced in ``[1, kappa_0]``."""
+
+    if dimension <= 0:
+        raise ValueError("dimension must be positive")
+    if not np.isfinite(condition_number) or condition_number < 1.0:
+        raise ValueError("condition_number must be finite and at least one")
+    eigenvalues = np.geomspace(1.0, condition_number, dimension)
+    eigenvectors = haar_orthogonal(rng, dimension)
+    covariance = (eigenvectors * eigenvalues) @ eigenvectors.T
+    return 0.5 * (covariance + covariance.T)
+
+
 def make_target(
     dimension: int,
     condition_number: float,
     rng: np.random.Generator,
     dtype: jnp.dtype,
+    *,
+    base_condition_number: float = 10.0,
+    base_covariance: np.ndarray | None = None,
+    transformation_eigenvectors: np.ndarray | None = None,
 ) -> GaussianTarget:
-    """Construct ``B`` with spectrum ``[1/kappa, 1]`` and ``Sigma=B^-1``."""
+    """Transform a well-conditioned Gaussian by ``z = B^{1/2} x``.
+
+    The base covariance is ``Sigma_0 = V D V.T`` with spectrum in
+    ``[1, base_condition_number]``. The returned target has precision
+    ``B^{1/2} Sigma_0^{-1} B^{1/2}`` and covariance
+    ``B^{-1/2} Sigma_0 B^{-1/2}``.
+    """
+
+    if not np.isfinite(condition_number) or condition_number < 1.0:
+        raise ValueError("condition_number must be finite and at least one")
+    if base_covariance is None:
+        base_covariance = make_well_conditioned_covariance(
+            dimension,
+            base_condition_number,
+            rng,
+        )
+    else:
+        base_covariance = np.asarray(base_covariance, dtype=np.float64)
+        if base_covariance.shape != (dimension, dimension):
+            raise ValueError("base_covariance must have shape (dimension, dimension)")
+        base_covariance = 0.5 * (base_covariance + base_covariance.T)
+        if np.linalg.eigvalsh(base_covariance)[0] <= 0.0:
+            raise ValueError("base_covariance must be positive definite")
 
     eigenvalues = np.geomspace(
         1.0 / condition_number,
         1.0,
         dimension,
     )
-    eigenvectors = haar_orthogonal(rng, dimension)
-    precision_np = (eigenvectors * eigenvalues) @ eigenvectors.T
+    if transformation_eigenvectors is None:
+        eigenvectors = haar_orthogonal(rng, dimension)
+    else:
+        eigenvectors = np.asarray(
+            transformation_eigenvectors,
+            dtype=np.float64,
+        )
+        if eigenvectors.shape != (dimension, dimension):
+            raise ValueError(
+                "transformation_eigenvectors must have shape "
+                f"{(dimension, dimension)}"
+            )
+        orthogonality_error = np.linalg.norm(
+            eigenvectors.T @ eigenvectors - np.eye(dimension)
+        )
+        if orthogonality_error > 1e-8:
+            raise ValueError("transformation_eigenvectors must be orthogonal")
+
+    transformation = (eigenvectors * eigenvalues) @ eigenvectors.T
+    transformation = 0.5 * (transformation + transformation.T)
+    transformation_sqrt = (eigenvectors * np.sqrt(eigenvalues)) @ eigenvectors.T
+    base_precision = np.linalg.inv(base_covariance)
+    precision_np = transformation_sqrt @ base_precision @ transformation_sqrt
+    precision_np = 0.5 * (precision_np + precision_np.T)
     precision = jnp.asarray(precision_np, dtype=dtype)
-    # Evaluate against the inverse of the matrix actually used by JAX.  This
-    # distinction matters only for deliberately extreme float32 condition
-    # numbers, where casting the nominal construction slightly moves B.
+    # Evaluate against the inverse of the matrix actually used by JAX. This
+    # keeps the analytic metric consistent with deliberately extreme float32
+    # targets, where casting slightly moves the constructed precision.
     covariance = np.linalg.inv(np.asarray(precision, dtype=np.float64))
     covariance = 0.5 * (covariance + covariance.T)
+
+    base_eigenvalues = np.linalg.eigvalsh(base_covariance)
+    base_smoothness = float(1.0 / base_eigenvalues[0])
+    base_strong_convexity = float(1.0 / base_eigenvalues[-1])
+    # If mu_0 I <= Sigma_0^{-1} <= L_0 I and
+    # kappa(B)^{-1} I <= B <= I, then
+    # (mu_0 / kappa(B)) I <= B^{1/2} Sigma_0^{-1} B^{1/2} <= L_0 I.
+    smoothness_bound = base_smoothness
+    strong_convexity_bound = base_strong_convexity / condition_number
 
     def potential(x: Array) -> Array:
         return 0.5 * x @ precision @ x
@@ -142,8 +235,12 @@ def make_target(
         return precision @ x
 
     return GaussianTarget(
+        base_covariance=base_covariance,
+        transformation=transformation,
         precision=precision,
         covariance=covariance,
+        smoothness_bound=smoothness_bound,
+        strong_convexity_bound=strong_convexity_bound,
         potential=potential,
         gradient=gradient,
     )
@@ -205,35 +302,76 @@ def relative_condition_number(
 
 def validate_target_and_metric(
     target: GaussianTarget,
-    requested_condition: float,
+    requested_transformation_condition: float,
+    requested_base_condition: float,
     relative_ridge: float,
 ) -> None:
-    """Check the analytic covariance and three exact metric invariants."""
+    """Check the base Gaussian, coordinate transform, and metric invariants."""
 
     original_precision = np.asarray(target.precision)
     is_float32 = original_precision.dtype == np.float32
     precision = np.asarray(original_precision, dtype=np.float64)
-    eigenvalues = np.linalg.eigvalsh(precision)
-    obtained_condition = float(eigenvalues[-1] / eigenvalues[0])
+    precision_eigenvalues = np.linalg.eigvalsh(precision)
     condition_tolerance = 2e-4 if is_float32 else 2e-9
+
+    base_condition = matrix_condition_number(target.base_covariance)
     if not np.isclose(
-        obtained_condition,
-        requested_condition,
+        base_condition,
+        requested_base_condition,
         rtol=condition_tolerance,
     ):
         raise AssertionError(
-            f"Constructed kappa(B)={obtained_condition:.12g}, expected "
-            f"{requested_condition:.12g}."
+            f"Constructed kappa(Sigma_0)={base_condition:.12g}, expected "
+            f"{requested_base_condition:.12g}."
         )
+
+    transformation_condition = matrix_condition_number(target.transformation)
+    if not np.isclose(
+        transformation_condition,
+        requested_transformation_condition,
+        rtol=condition_tolerance,
+    ):
+        raise AssertionError(
+            f"Constructed kappa(B)={transformation_condition:.12g}, expected "
+            f"{requested_transformation_condition:.12g}."
+        )
+
+    transformation_eigenvalues, transformation_eigenvectors = np.linalg.eigh(
+        target.transformation
+    )
+    transformation_inv_sqrt = (
+        transformation_eigenvectors * (1.0 / np.sqrt(transformation_eigenvalues))
+    ) @ transformation_eigenvectors.T
+    coordinate_covariance = (
+        transformation_inv_sqrt @ target.base_covariance @ transformation_inv_sqrt
+    )
+    coordinate_error = float(
+        np.linalg.norm(target.covariance - coordinate_covariance)
+        / np.linalg.norm(coordinate_covariance)
+    )
+    coordinate_tolerance = 5e-3 if is_float32 else 1e-8
+    if coordinate_error > coordinate_tolerance:
+        raise AssertionError(
+            "Transformed covariance does not match "
+            "B^{-1/2} Sigma_0 B^{-1/2}; relative error is "
+            f"{coordinate_error:.3e}."
+        )
+
     inverse_error = float(
         np.linalg.norm(precision @ target.covariance - np.eye(len(precision)))
     )
     inverse_tolerance = 5e-2 if is_float32 else 1e-7
     if inverse_error > inverse_tolerance:
-        raise AssertionError(
-            "Analytic covariance inverse error is "
-            f"{inverse_error:.3e}."
-        )
+        raise AssertionError(f"Analytic covariance inverse error: {inverse_error:.3e}.")
+
+    bound_tolerance = 5e-5 if is_float32 else 2e-9
+    if (
+        precision_eigenvalues[0]
+        < (1.0 - bound_tolerance) * target.strong_convexity_bound
+    ):
+        raise AssertionError("The transformed precision violates its lower bound.")
+    if precision_eigenvalues[-1] > (1.0 + bound_tolerance) * target.smoothness_bound:
+        raise AssertionError("The transformed precision violates its upper bound.")
 
     exact = relative_condition_number(
         target.covariance,
@@ -250,16 +388,36 @@ def validate_target_and_metric(
         target.covariance,
         relative_ridge,
     )
+    target_condition = float(precision_eigenvalues[-1] / precision_eigenvalues[0])
     if not np.isclose(exact, 1.0, rtol=2e-8):
         raise AssertionError(f"kappa_rel(Sigma) should be one, got {exact:.8g}.")
     if not np.isclose(rescaled, 1.0, rtol=2e-8):
+        raise AssertionError(f"kappa_rel(c Sigma) should be one, got {rescaled:.8g}.")
+    metric_tolerance = 2e-4 if is_float32 else 2e-8
+    if not np.isclose(identity, target_condition, rtol=metric_tolerance):
         raise AssertionError(
-            f"kappa_rel(c Sigma) should be one, got {rescaled:.8g}."
+            f"kappa_rel(I) should be {target_condition:g}, got {identity:.8g}."
         )
-    if not np.isclose(identity, requested_condition, rtol=2e-8):
-        raise AssertionError(
-            f"kappa_rel(I) should be {requested_condition:g}, got {identity:.8g}."
-        )
+
+
+def exact_cooling_relative_conditions(
+    target: GaussianTarget,
+    cooling_gamma: float,
+    num_stages: int,
+) -> np.ndarray:
+    """Return the exact stagewise metric for the Gaussian cooling targets."""
+
+    precision_eigenvalues = np.linalg.eigvalsh(
+        np.asarray(target.precision, dtype=np.float64)
+    )
+    smallest = float(precision_eigenvalues[0])
+    largest = float(precision_eigenvalues[-1])
+    stages = np.arange(num_stages + 1)
+    strengths = target.smoothness_bound * cooling_gamma**stages
+    oracle = (1.0 + strengths / smallest) / (1.0 + strengths / largest)
+    # Displayed stage zero is the initializer I/L, not the gamma**0 target.
+    oracle[0] = largest / smallest
+    return oracle
 
 
 def staged_target_covariance(
@@ -308,7 +466,6 @@ def estimate_all_methods(
     target: GaussianTarget,
     *,
     dimension: int,
-    condition_number: float,
     cooling_gamma: float,
     delta: float,
     friction: float,
@@ -329,10 +486,13 @@ def estimate_all_methods(
         target.potential,
         target.gradient,
         minimizer,
-        alpha=min(1.0 - 1e-12, 1.0 / condition_number),
+        alpha=min(
+            1.0 - 1e-12,
+            target.strong_convexity_bound / target.smoothness_bound,
+        ),
         delta=delta,
         cooling_gamma=cooling_gamma,
-        smoothness_L=1.0,
+        smoothness_L=target.smoothness_bound,
         num_stages=num_stages,
         num_chains=num_chains,
         num_ulmc_steps=num_steps,
@@ -345,7 +505,7 @@ def estimate_all_methods(
         key_staged,
         target,
         minimizer,
-        smoothness=1.0,
+        smoothness=target.smoothness_bound,
         friction=friction,
         step_size=step_size,
         num_steps=num_steps,
@@ -361,7 +521,7 @@ def estimate_all_methods(
         target.gradient,
         minimizer,
         friction,
-        1.0,
+        target.smoothness_bound,
         step_size,
         num_steps * num_stages,
         num_chains,
@@ -394,26 +554,50 @@ def run_experiment(args: argparse.Namespace) -> ExperimentResult:
     kappas = np.sort(np.asarray(args.kappas, dtype=float))
     root_key = random.PRNGKey(args.seed)
     relative_conditions = {
-        method: np.empty((len(kappas), args.repeats), dtype=float)
-        for method in METHODS
+        method: np.empty((len(kappas), args.repeats), dtype=float) for method in METHODS
     }
+    target_conditions = np.empty(len(kappas), dtype=float)
     hardest_target: GaussianTarget | None = None
+
+    # Hold both Haar bases fixed across the sweep so changing kappa(B) changes
+    # only the transformation eigenvalues, rather than confounding the curve
+    # with a new relative orientation at every x-axis value.
+    geometry_rng = np.random.default_rng(np.random.SeedSequence([args.seed, 1729]))
+    base_covariance = make_well_conditioned_covariance(
+        args.dimension,
+        args.base_condition_number,
+        geometry_rng,
+    )
+    transformation_eigenvectors = haar_orthogonal(
+        geometry_rng,
+        args.dimension,
+    )
+    base_condition = matrix_condition_number(base_covariance)
 
     started = time.perf_counter()
     for kappa_index, kappa in enumerate(kappas):
-        target_rng = np.random.default_rng(
-            np.random.SeedSequence([args.seed, 1729, kappa_index])
+        target = make_target(
+            args.dimension,
+            float(kappa),
+            geometry_rng,
+            dtype,
+            base_condition_number=args.base_condition_number,
+            base_covariance=base_covariance,
+            transformation_eigenvectors=transformation_eigenvectors,
         )
-        target = make_target(args.dimension, float(kappa), target_rng, dtype)
         validate_target_and_metric(
             target,
             float(kappa),
+            args.base_condition_number,
             0.0,
         )
+        target_condition = matrix_condition_number(target.covariance)
+        target_conditions[kappa_index] = target_condition
         if kappa_index == len(kappas) - 1:
             hardest_target = target
         print(
             f"kappa(B)={kappa:g}: "
+            f"kappa(Sigma_target)={target_condition:.4g}, "
             f"{args.repeats} repeats, d={args.dimension}, "
             f"chains={args.chains}, steps={args.steps}, stages={args.stages}",
             flush=True,
@@ -425,7 +609,6 @@ def run_experiment(args: argparse.Namespace) -> ExperimentResult:
                 run_key,
                 target,
                 dimension=args.dimension,
-                condition_number=float(kappa),
                 cooling_gamma=args.cooling_gamma,
                 delta=args.delta,
                 friction=args.friction,
@@ -451,7 +634,7 @@ def run_experiment(args: argparse.Namespace) -> ExperimentResult:
     # stage/gradient budget.  Reusing the key makes every prefix nested: the
     # first k stages or k*N plain transitions are identical across prefixes.
     assert hardest_target is not None
-    hardest_kappa = float(kappas[-1])
+    hardest_target_condition = float(target_conditions[-1])
     convergence_conditions = {
         method: np.empty(
             (args.stages + 1, args.convergence_repeats),
@@ -460,7 +643,7 @@ def run_experiment(args: argparse.Namespace) -> ExperimentResult:
         for method in METHODS
     }
     for method in METHODS:
-        convergence_conditions[method][0, :] = hardest_kappa
+        convergence_conditions[method][0, :] = hardest_target_condition
 
     print(
         f"hardest-case convergence: stages 1..{args.stages}, "
@@ -474,7 +657,6 @@ def run_experiment(args: argparse.Namespace) -> ExperimentResult:
                 convergence_key,
                 hardest_target,
                 dimension=args.dimension,
-                condition_number=hardest_kappa,
                 cooling_gamma=args.cooling_gamma,
                 delta=args.delta,
                 friction=args.friction,
@@ -494,18 +676,17 @@ def run_experiment(args: argparse.Namespace) -> ExperimentResult:
                     )
                 )
 
-    stage_indices = np.arange(args.stages + 1)
-    cooling_strengths = args.cooling_gamma**stage_indices
-    exact_cooling_oracle = (
-        1.0 + hardest_kappa * cooling_strengths
-    ) / (1.0 + cooling_strengths)
-    # Stage zero is the implementation's initial I/L preconditioner, not a
-    # sampled gamma**0 cooled covariance.
-    exact_cooling_oracle[0] = hardest_kappa
+    exact_cooling_oracle = exact_cooling_relative_conditions(
+        hardest_target,
+        args.cooling_gamma,
+        args.stages,
+    )
 
     elapsed = time.perf_counter() - started
     return ExperimentResult(
         kappas=kappas,
+        target_conditions=target_conditions,
+        base_condition_number=base_condition,
         relative_conditions=relative_conditions,
         convergence_conditions=convergence_conditions,
         exact_cooling_oracle=exact_cooling_oracle,
@@ -581,10 +762,9 @@ def make_figures(
     ax.set_ylabel(r"Relative condition number $\kappa_{\mathrm{rel}}$")
     ax.set_title(
         "Preconditioner quality under affine transformations\n"
+        rf"$\kappa(\Sigma_0)={result.base_condition_number:g}$, "
         rf"$d={dimension}$, $n={num_chains}$, $N={num_steps}$, "
-        rf"$K={num_stages}$"
-        + "\n"
-        + rf"$\gamma_{{\rm cool}}={cooling_gamma:g}$, "
+        rf"$K={num_stages}$" + "\n" + rf"$\gamma_{{\rm cool}}={cooling_gamma:g}$, "
         rf"$h={step_size:g}$, "
         rf"$\gamma_{{\rm fric}}={friction:g}$"
     )
@@ -630,11 +810,11 @@ def make_figures(
     ax.set_ylabel(r"Relative condition number $\kappa_{\mathrm{rel}}$")
     ax.set_title(
         "Hardest-case convergence\n"
+        rf"$\kappa(\Sigma_0)={result.base_condition_number:g}$, "
         rf"$\kappa(B)={result.kappas[-1]:g}$, "
+        rf"$\kappa(\Sigma_B)={result.target_conditions[-1]:.3g}$" + "\n"
         rf"$d={dimension}$, $n={num_chains}$, $N={num_steps}$, "
-        rf"$K={num_stages}$"
-        + "\n"
-        + rf"$\gamma_{{\rm cool}}={cooling_gamma:g}$, "
+        rf"$K={num_stages}$" + "\n" + rf"$\gamma_{{\rm cool}}={cooling_gamma:g}$, "
         rf"$h={step_size:g}$, "
         rf"$\gamma_{{\rm fric}}={friction:g}$"
     )
@@ -666,18 +846,12 @@ def save_publication_figures(
 
 def _parse_positive_floats(value: str) -> list[float]:
     try:
-        values = [
-            float(part.strip())
-            for part in value.split(",")
-            if part.strip()
-        ]
+        values = [float(part.strip()) for part in value.split(",") if part.strip()]
     except ValueError as exc:
         raise argparse.ArgumentTypeError(
             "Expected comma-separated floating-point condition numbers."
         ) from exc
-    if not values or any(
-        not np.isfinite(item) or item < 1.0 for item in values
-    ):
+    if not values or any(not np.isfinite(item) or item < 1.0 for item in values):
         raise argparse.ArgumentTypeError(
             "Expected finite comma-separated condition numbers, each at least one."
         )
@@ -706,6 +880,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=_parse_positive_floats,
         default=[1.0, 10.0, 100.0, 1_000.0, 10_000.0],
         help="Comma-separated condition numbers for B.",
+    )
+    parser.add_argument(
+        "--base-condition-number",
+        type=float,
+        default=10.0,
+        help="Condition number of the well-conditioned base covariance Sigma_0.",
     )
     parser.add_argument(
         "--repeats",
@@ -819,8 +999,7 @@ def _explicit_cli_destinations(
     destinations: set[str] = set()
     for action in parser._actions:
         if any(
-            argument == option
-            or argument.startswith(f"{option}=")
+            argument == option or argument.startswith(f"{option}=")
             for argument in arguments
             for option in action.option_strings
         ):
@@ -836,11 +1015,7 @@ def apply_quick_configuration(
 
     if not args.quick:
         return
-    explicitly_set = (
-        set()
-        if explicit_destinations is None
-        else explicit_destinations
-    )
+    explicitly_set = set() if explicit_destinations is None else explicit_destinations
     quick_values = {
         "dimension": 6,
         "kappas": [1.0, 30.0, 1_000.0],
@@ -873,10 +1048,9 @@ def validate_arguments(args: argparse.Namespace) -> None:
             "--chains must exceed --dimension so the dense empirical "
             "covariances can be positive definite."
         )
-    if (
-        not np.isfinite(args.cooling_gamma)
-        or not 0.0 < args.cooling_gamma < 1.0
-    ):
+    if not np.isfinite(args.base_condition_number) or args.base_condition_number < 1.0:
+        raise ValueError("--base-condition-number must be finite and at least one.")
+    if not np.isfinite(args.cooling_gamma) or not 0.0 < args.cooling_gamma < 1.0:
         raise ValueError("--cooling-gamma must lie in (0, 1).")
     positive_scalars = {
         "delta": args.delta,
@@ -912,17 +1086,21 @@ def validate_arguments(args: argparse.Namespace) -> None:
 
 
 def print_summary(result: ExperimentResult) -> None:
-    column_widths = {
-        method: max(29, len(method) + 2)
-        for method in METHODS
-    }
-    header = "kappa(B)".ljust(12) + "".join(
-        method.rjust(column_widths[method]) for method in METHODS
+    column_widths = {method: max(29, len(method) + 2) for method in METHODS}
+    header = (
+        "kappa(B)".ljust(12)
+        + "kappa(Sigma_B)".rjust(18)
+        + "".join(method.rjust(column_widths[method]) for method in METHODS)
     )
-    print("\nMedian relative condition number")
+    print(
+        "\nMedian relative condition number "
+        f"(kappa(Sigma_0)={result.base_condition_number:g})"
+    )
     print(header)
     for index, kappa in enumerate(result.kappas):
-        row = f"{kappa:g}".ljust(12)
+        row = f"{kappa:g}".ljust(12) + f"{result.target_conditions[index]:.5g}".rjust(
+            18
+        )
         for method in METHODS:
             median = np.median(result.relative_conditions[method][index])
             row += f"{median:{column_widths[method]}.4g}"
