@@ -1,0 +1,5 @@
+# Runtime dependencies. The code requires Python 3.10 or newer.
+jax>=0.4.23,<1
+numpy>=1.26,<3
+matplotlib>=3.7,<4
+emcee>=3.1,<4

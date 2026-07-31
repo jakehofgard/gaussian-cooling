@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.venv/
+venv/
+
+# Test and tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Generated experiment output
+figures/
+results/
+*.pdf
+
+# Editors and operating systems
+.DS_Store
+.idea/
+.vscode/
