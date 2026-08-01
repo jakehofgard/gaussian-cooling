@@ -322,47 +322,39 @@ convergence figure.
 
 ### Large translation-invariant lattice phi4 run
 
-First run the proposed sizes as separate one-repeat jobs. A failure at the
-largest size then cannot discard the completed smaller-size PDFs, and the
-successful compilations remain cached:
+The conservative one-command H100 run is:
 
 ```bash
-for GC_SIDE in 100 250 500; do
-  python -u experiment_truncated_phi4.py \
-    --sides "${GC_SIDE}" --chains 512 --steps 64 --stages 8 --repeats 1 \
-    --reference-chains 256 --reference-steps 256 --dtype float32 \
-    --dense-max-side 0 \
-    --skip-diagnostics --skip-comparisons --skip-parameter-sweeps \
-    --output-prefix "${RUN_DIR}/phi4_benchmark_d${GC_SIDE}" \
-    2>&1 | tee "${RUN_DIR}/phi4_benchmark_d${GC_SIDE}.log"
-done
+python -u experiment_truncated_phi4.py --gpu \
+  --output-prefix "${RUN_DIR}/phi4_gpu_scale" \
+  2>&1 | tee "${RUN_DIR}/phi4_gpu_scale.log"
 ```
 
-After all three sizes fit and their timings are acceptable, produce the joint
-publication plot with the desired repeat count:
+The flag verifies that JAX sees a GPU, then runs sides 64, 128, 256, 512, and
+1024 with 64 chains, 128 reference chains, 32 transitions per stage, eight
+stages, one repeat, and float32. It disables dense matrices, diagnostics,
+stage comparisons, and parameter sweeps. Explicit flags override every preset
+value.
+
+If the first run fits comfortably, increase precision deliberately, for
+example:
 
 ```bash
-python -u experiment_truncated_phi4.py \
-  --sides 100,250,500 --chains 512 --steps 64 --stages 8 --repeats 3 \
-  --reference-chains 256 --reference-steps 256 --dtype float32 \
-  --dense-max-side 0 \
-  --skip-diagnostics --skip-comparisons --skip-parameter-sweeps \
-  --output-prefix "${RUN_DIR}/phi4_scale" \
-  2>&1 | tee "${RUN_DIR}/phi4_scale.log"
+python -u experiment_truncated_phi4.py --gpu \
+  --chains 128 --reference-chains 256 --repeats 3 \
+  --output-prefix "${RUN_DIR}/phi4_gpu_scale_n128" \
+  2>&1 | tee "${RUN_DIR}/phi4_gpu_scale_n128.log"
 ```
 
 For a side length `d`, the state dimension is `D=d^2`. The Fourier covariance
 representation is `O(D)`, but live chain storage is `O(chains * D)` and the
 batched FFT work is approximately `O(chains * D log D)`. In float32 at
-`d=500`, `chains=512`, one real chain-state array is about 488 MiB and the
-explicit `(chains, D, 2)` Gaussian-noise tensor alone is about 977 MiB; complex
-FFT workspaces and other live arrays add to this. Float64 doubles the real
-array sizes. Inspect peak memory at each step of the 100 -> 250 -> 500 ladder.
-
-Keep `--dense-max-side 0` for scaling runs: a single dense `D`-by-`D` float32
-matrix requires `4 D^2` bytes, before factorization workspaces, and dense
-eigendecompositions cost cubic time. Each method also executes one unmeasured
-warmup before its requested repeats, so even `--repeats 1` evaluates it twice.
+`d=1024`, `chains=64`, one real chain-state array is 256 MiB and the explicit
+`(chains, D, 2)` Gaussian-noise tensor is 512 MiB; complex FFT workspaces and
+other live arrays add substantially to this. Float64 doubles the real-array
+sizes. A dense `D`-by-`D` float32 matrix would require 4 TiB, which is why the
+preset disables every dense path. Each method also executes one unmeasured
+warmup before its requested repeat.
 
 Run the smaller, qualitatively different outputs separately:
 

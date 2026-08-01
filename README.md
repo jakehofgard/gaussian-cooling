@@ -65,6 +65,24 @@ python experiment_truncated_phi4.py \
   --output-prefix figures/truncated_phi4
 ```
 
+H100-scale lattice comparison through side 1024:
+
+```bash
+python experiment_truncated_phi4.py --gpu \
+  --output-prefix figures/phi4_gpu_scale
+```
+
+`--gpu` refuses to run without a JAX GPU backend. Its conservative preset uses
+sides 64, 128, 256, 512, and 1024; 64 chains; 128 reference chains; one repeat;
+float32; and no dense, diagnostic, stage-comparison, or parameter-sweep paths.
+This is a feasibility and timing run, not a statistically final configuration.
+Explicit options override these values. Use `--run-diagnostics`,
+`--run-comparisons`, or `--run-parameter-sweeps` to opt those components back
+in; diagnostics then use side 64 unless `--diagnostic-side` says otherwise.
+These components are intentionally excluded from the million-site scaling
+run. Add `--radius inf --cooling-design-radius 4` to use the genuine quartic
+target at the same GPU sizes.
+
 The first run includes JAX compilation. Explicit options override the
 `--quick` preset. Use `--help` for all controls and defaults.
 
@@ -108,13 +126,28 @@ U(\phi)
 ```
 
 where $u_R(z)=\lambda z^4/4+mz^2/2$ for $|z|\leq R$, with a quadratic
-continuation outside that interval. The curvature parameters are
+continuation outside that interval. For finite $R$, the curvature parameters
+are
 
 ```math
 \mu=m,\qquad
 L=\lambda_{\max}(\Delta_\beta)+m+3\lambda R^2,\qquad
 \alpha=\left(1+\frac{3\lambda R^2}{m}\right)^{-1}.
 ```
+
+Setting `--radius inf` selects the genuine quartic potential everywhere. Its
+Hessian is unbounded, so no finite global $L$ exists. In this case,
+`--cooling-design-radius` supplies a finite operational scale
+
+```math
+L_{\mathrm{design}}
+=\lambda_{\max}(\Delta_\beta)+m+3\lambda R_{\mathrm{design}}^2
+```
+
+for stage zero and fixed-step tuning only. It does not truncate the target,
+and the finite-global-$L$ guarantee does not apply. The console reports the
+reference fraction beyond $R_{\mathrm{design}}$; repeat important runs with a
+larger design radius and a smaller step size as a sensitivity check.
 
 The four primary methods are translation-invariant Gaussian cooling,
 translation-invariant empirical preconditioning, translation averaging of
@@ -123,7 +156,17 @@ endpoints.
 
 The production run also compares all four methods across
 $\lambda\in\{0.1,0.5,2\}$, $m\in\{0.01,0.05,0.25\}$, and
-$R\in\{0.5,2,4\}$.
+$R\in\{0.5,2,4,\infty\}$. The radius comparison uses one common
+$R_{\mathrm{design}}=4$ and creates a second PDF showing
+$\kappa_{\mathrm{rel}}(\Sigma_R,\Sigma_\infty)$ for the reference spectra.
+
+To run only a small genuine-quartic main experiment:
+
+```bash
+python experiment_truncated_phi4.py --quick --radius inf \
+  --cooling-design-radius 2 --skip-diagnostics --skip-comparisons \
+  --skip-parameter-sweeps
+```
 
 The full defaults include lattices through $d=100$, parameter sweeps,
 two-point-correlator IATs, and symmetry diagnostics. Optional components can
@@ -136,7 +179,8 @@ be disabled with:
 ```
 
 Dense methods are skipped automatically when infeasible. For large GPU runs,
-use `--dtype float32` and initially disable dense comparisons and diagnostics.
+use the `--gpu` preset and increase chains or repeats only after the
+one-repeat run fits in device memory.
 
 ## Library use
 

@@ -1,4 +1,4 @@
-"""Experiment comparing preconditioners on a truncated lattice phi^4 target.
+"""Experiment comparing preconditioners on lattice phi^4 targets.
 
 The target is defined on a two-dimensional periodic square lattice. The
 script compares four primary estimators: translation-invariant Gaussian
@@ -31,18 +31,20 @@ diagonal and the other retains the full covariance. The latter is reported
 as rank deficient whenever ``n <= d**2``.
 
 The production run also performs controlled one-factor sweeps of ``lambda``,
-``m``, and ``R`` at a feasible fixed lattice side.  Each sweep uses a shared
-challenging anchor target, common random numbers, and exactly the same four
-primary methods.  The shared anchor is cached, so the three default
-three-point sweeps require only seven unique targets.  Each sweep is saved as
-its own vector PDF.
+``m``, and ``R`` at a feasible fixed lattice side.  The radius comparison
+includes ``R=inf``, which is the genuine (untruncated) quartic target, and
+uses a common finite operational curvature radius for all of its targets.
+This keeps stage zero and the cooling schedule comparable.  For the genuine
+quartic this operational radius is a tuning scale, not a global Hessian
+bound: the quartic Hessian is unbounded and the finite-smoothness theory does
+not apply.  Each sweep is saved as its own vector PDF.
 
 The script exposes step size, friction, sample count, transition count, and
 stage count directly. ``--delta`` records the theoretical preconditioning
 tolerance but does not otherwise alter a fixed-budget recurrence.
 
-The independently preconditioned reference target has smoothness
-``1 + 3 * lambda * R**2 / m``.  For small-mass sweeps,
+The independently preconditioned reference target uses the operational
+curvature scale ``1 + 3 * lambda * R_design**2 / m``.  For small-mass sweeps,
 ``--reference-step-size`` can therefore be reduced without changing the
 step size or physical budget of any method being compared.
 
@@ -51,8 +53,11 @@ The default physical parameters ``beta=2``, ``lambda=0.5``, ``m=0.25``, and
 for the former all-ones defaults.  The default step size is reduced to 0.03
 to preserve a similar dimensionless curvature margin.
 
-After cooling the largest lattice, a serial preconditioned ULMC trajectory is
-used for two sampling diagnostics.  ``emcee`` estimates the integrated
+After cooling the selected diagnostic lattice, a serial preconditioned ULMC
+trajectory is used for two sampling diagnostics. The largest requested side
+is used ordinarily. The ``--gpu`` scaling preset skips these diagnostics by
+default while extending the scalable comparisons through side 1024; an
+explicit opt-in uses side 64. ``emcee`` estimates the integrated
 autocorrelation time of every entry in the first sample-covariance row, using
 ``g_x(t) = (phi_t(0) - phi_bar(0)) (phi_t(x) - phi_bar(x))``.
 The resulting plot contains every lattice site and displays mixing versus
@@ -71,6 +76,10 @@ Fast end-to-end smoke test:
 Production defaults:
 
     python experiment_truncated_phi4.py
+
+H100-scale defaults through side 1024:
+
+    python experiment_truncated_phi4.py --gpu
 """
 
 from __future__ import annotations
@@ -125,6 +134,9 @@ GREEN = "#009E73"
 PURPLE = "#CC79A7"
 GRAY = "#6B6B6B"
 
+GPU_LATTICE_SIDES = (64, 128, 256, 512, 1024)
+GPU_DIAGNOSTIC_MAX_SIDE = 100
+
 COOLING_COMPARISON = "Translation-invariant Gaussian cooling"
 EMPIRICAL_COMPARISON = (
     "Translation-invariant empirical preconditioning (no cooling)"
@@ -156,20 +168,29 @@ PLOT_LABELS = {
 
 @dataclass(frozen=True)
 class LatticeModel:
-    """Truncated periodic lattice phi^4 target."""
+    """Periodic lattice phi^4 target and its algorithmic tuning scales.
+
+    ``radius`` is the physical continuation radius; positive infinity means
+    the genuine quartic target. ``design_radius`` determines the finite
+    stage-zero covariance and fixed-step ULMC tuning. For a truncated target,
+    ``design_radius >= radius`` gives a valid (possibly conservative) global
+    smoothness bound. For the genuine quartic it is only an operational scale.
+    """
 
     side: int
     beta: float
     quartic: float
     mass: float
     radius: float
+    design_radius: float
     dtype: jnp.dtype
     potential: PotentialFn
     gradient: PotentialFn
     laplacian_spectrum: np.ndarray
-    smoothness: float
+    design_smoothness: float
+    global_smoothness_bound: float
     strong_convexity: float
-    conditioning_alpha: float
+    design_conditioning_alpha: float
 
     @property
     def dimension(self) -> int:
@@ -178,6 +199,10 @@ class LatticeModel:
     @property
     def lattice_shape(self) -> tuple[int, int]:
         return (self.side, self.side)
+
+    @property
+    def is_truncated(self) -> bool:
+        return bool(np.isfinite(self.radius))
 
 
 @dataclass
@@ -222,6 +247,8 @@ class ParameterSweepResult:
     hessian_condition_bounds: dict[str, np.ndarray]
     reference_conditions: dict[str, np.ndarray]
     continuation_fractions: dict[str, np.ndarray]
+    design_exceedance_fractions: dict[str, np.ndarray]
+    truncation_to_quartic_conditions: np.ndarray
     reference_step_sizes: dict[str, np.ndarray]
     reference_steps: dict[str, np.ndarray]
     stages: int
@@ -238,6 +265,8 @@ class _PrimaryMethodEvaluation:
     hessian_condition_bound: float
     reference_condition: float
     continuation_fraction: float
+    design_exceedance_fraction: float
+    reference_spectrum: np.ndarray
     reference_step_size: float
     reference_steps: int
 
@@ -277,11 +306,18 @@ def _truncated_scalar_potential(
     mass: float,
     radius: float,
 ) -> tuple[Array, Array]:
-    """Return ``(w_R, w_R')`` using the tangent-quadratic continuation.
+    """Return ``(w_R, w_R')`` for a finite or infinite target radius.
 
     Clipping to the truncation boundary gives a compact expression exactly
-    equivalent to the interior and both quadratic continuation branches.
+    equivalent to the interior and both quadratic continuation branches. At
+    ``radius=inf`` this function evaluates the genuine quartic directly; no
+    clipping or continuation is applied.
     """
+
+    if np.isposinf(radius):
+        value = 0.25 * quartic * values**4 + 0.5 * mass * values**2
+        gradient = quartic * values**3 + mass * values
+        return value, gradient
 
     anchor = jnp.clip(values, -radius, radius)
     offset = values - anchor
@@ -306,14 +342,50 @@ def make_lattice_model(
     mass: float,
     radius: float,
     dtype: jnp.dtype,
+    *,
+    design_radius: float | None = None,
 ) -> LatticeModel:
-    """Construct the truncated phi4 target, gradient, and spectral bounds."""
+    """Construct a truncated or genuine quartic lattice target.
+
+    A finite target defaults to the tight choice ``design_radius=radius``.
+    The genuine quartic (``radius=inf``) requires a finite design radius,
+    because it has no finite global smoothness constant. In that case the
+    resulting ``design_smoothness`` is used only for stage zero and numerical
+    tuning and carries no global-smoothness guarantee.
+    """
 
     if side < 2:
         raise ValueError("Lattice side length must be at least two.")
-    if beta < 0.0 or quartic <= 0.0 or mass <= 0.0 or radius <= 0.0:
+    radius = float(radius)
+    is_truncated = bool(np.isfinite(radius))
+    if (
+        not np.isfinite(beta)
+        or beta < 0.0
+        or not np.isfinite(quartic)
+        or quartic <= 0.0
+        or not np.isfinite(mass)
+        or mass <= 0.0
+        or radius <= 0.0
+        or (not is_truncated and not np.isposinf(radius))
+    ):
         raise ValueError(
-            "Require beta >= 0 and quartic, mass, radius > 0."
+            "Require finite beta >= 0, finite quartic and mass > 0, and "
+            "radius > 0 or radius=inf."
+        )
+    if design_radius is None:
+        if not is_truncated:
+            raise ValueError(
+                "The genuine quartic target requires a finite positive "
+                "design_radius for stage-zero and ULMC tuning."
+            )
+        design_radius = radius
+    design_radius = float(design_radius)
+    if not np.isfinite(design_radius) or design_radius <= 0.0:
+        raise ValueError("design_radius must be finite and positive.")
+    if is_truncated and design_radius < radius:
+        raise ValueError(
+            "A truncated target requires design_radius >= radius so its "
+            "design smoothness remains a valid global upper bound."
         )
 
     def potential(phi: Array) -> Array:
@@ -344,9 +416,16 @@ def make_lattice_model(
         one_dimensional[:, None] + one_dimensional[None, :]
     )
     max_laplacian = float(np.max(laplacian_spectrum))
-    smoothness = max_laplacian + mass + 3.0 * quartic * radius**2
-    conditioning_alpha = 1.0 / (
-        1.0 + 3.0 * quartic * radius**2 / mass
+    design_smoothness = (
+        max_laplacian + mass + 3.0 * quartic * design_radius**2
+    )
+    global_smoothness_bound = (
+        max_laplacian + mass + 3.0 * quartic * radius**2
+        if is_truncated
+        else np.inf
+    )
+    design_conditioning_alpha = 1.0 / (
+        1.0 + 3.0 * quartic * design_radius**2 / mass
     )
     return LatticeModel(
         side=side,
@@ -354,13 +433,15 @@ def make_lattice_model(
         quartic=quartic,
         mass=mass,
         radius=radius,
+        design_radius=design_radius,
         dtype=dtype,
         potential=potential,
         gradient=gradient,
         laplacian_spectrum=laplacian_spectrum,
-        smoothness=smoothness,
+        design_smoothness=design_smoothness,
+        global_smoothness_bound=global_smoothness_bound,
         strong_convexity=mass,
-        conditioning_alpha=conditioning_alpha,
+        design_conditioning_alpha=design_conditioning_alpha,
     )
 
 
@@ -369,8 +450,8 @@ def validate_lattice_model(model: LatticeModel) -> None:
 
     side = model.side
     test_values = jnp.linspace(
-        -1.7 * model.radius,
-        1.7 * model.radius,
+        -1.7 * model.design_radius,
+        1.7 * model.design_radius,
         model.dimension,
         dtype=model.dtype,
     )
@@ -383,6 +464,25 @@ def validate_lattice_model(model: LatticeModel) -> None:
             f"Analytic lattice gradient error {gradient_error:.3e} "
             f"exceeds {tolerance:.1e}."
         )
+
+    if not model.is_truncated:
+        field = test_values.reshape((side, side))
+        expected_value = float(
+            0.5 * jnp.vdot(
+                field,
+                _periodic_laplacian(field, model.beta),
+            )
+            + jnp.sum(
+                0.25 * model.quartic * field**4
+                + 0.5 * model.mass * field**2
+            )
+        )
+        direct_error = abs(float(model.potential(test_values)) - expected_value)
+        if direct_error > 10.0 * tolerance * max(abs(expected_value), 1.0):
+            raise AssertionError(
+                "The R=inf target does not match the genuine quartic "
+                f"formula (error {direct_error:.3e})."
+            )
 
     field = test_values.reshape((side, side))
     shifted = jnp.roll(field, shift=(1, -1), axis=(0, 1)).reshape((-1,))
@@ -426,10 +526,10 @@ def _fourier_cooling_call(
         model.potential,
         model.gradient,
         jnp.zeros(model.dimension, dtype=model.dtype),
-        alpha=model.conditioning_alpha,
+        alpha=model.design_conditioning_alpha,
         delta=args.delta,
         cooling_gamma=args.cooling_gamma,
-        smoothness_L=model.smoothness,
+        smoothness_L=model.design_smoothness,
         num_stages=num_stages,
         num_chains=args.chains,
         num_ulmc_steps=args.steps,
@@ -457,7 +557,7 @@ def _unpreconditioned_samples_call(
         model.gradient,
         jnp.zeros(model.dimension, dtype=model.dtype),
         args.friction,
-        model.smoothness,
+        model.design_smoothness,
         args.step_size,
         args.steps * num_stages,
         args.chains,
@@ -535,7 +635,7 @@ def _make_unpreconditioned_stage_history_call(
     num_chains = args.chains
     dtype = model.dtype
     initial_spectrum = (
-        jnp.ones(dimension, dtype=dtype) / model.smoothness
+        jnp.ones(dimension, dtype=dtype) / model.design_smoothness
     )
     (
         momentum_decay,
@@ -555,7 +655,7 @@ def _make_unpreconditioned_stage_history_call(
             key_position,
             (num_chains, dimension),
             dtype=dtype,
-        ) / jnp.sqrt(jnp.asarray(model.smoothness, dtype=dtype))
+        ) / jnp.sqrt(jnp.asarray(model.design_smoothness, dtype=dtype))
         momenta = random.normal(
             key_momentum,
             (num_chains, dimension),
@@ -649,10 +749,10 @@ def _fourier_empirical_baseline_call(
         model.potential,
         model.gradient,
         jnp.zeros(model.dimension, dtype=model.dtype),
-        alpha=model.conditioning_alpha,
+        alpha=model.design_conditioning_alpha,
         delta=args.delta,
         cooling_gamma=0.0,
-        smoothness_L=model.smoothness,
+        smoothness_L=model.design_smoothness,
         num_stages=num_stages,
         num_chains=args.chains,
         num_ulmc_steps=args.steps,
@@ -682,7 +782,8 @@ def _fourier_stage_history(
     """
 
     spectrum: Array = (
-        jnp.ones(model.dimension, dtype=model.dtype) / model.smoothness
+        jnp.ones(model.dimension, dtype=model.dtype)
+        / model.design_smoothness
     )
     history: list[Array] = [spectrum]
     for stage_index in range(1, args.stages + 1):
@@ -693,10 +794,10 @@ def _fourier_stage_history(
                 model.potential,
                 model.gradient,
                 jnp.zeros(model.dimension, dtype=model.dtype),
-                alpha=model.conditioning_alpha,
+                alpha=model.design_conditioning_alpha,
                 delta=args.delta,
                 cooling_gamma=args.cooling_gamma**stage_index,
-                smoothness_L=model.smoothness,
+                smoothness_L=model.design_smoothness,
                 num_stages=1,
                 num_chains=args.chains,
                 num_ulmc_steps=args.steps,
@@ -730,10 +831,10 @@ def _dense_cooling_call(
         model.potential,
         model.gradient,
         jnp.zeros(model.dimension, dtype=model.dtype),
-        alpha=model.conditioning_alpha,
+        alpha=model.design_conditioning_alpha,
         delta=args.delta,
         cooling_gamma=args.cooling_gamma,
-        smoothness_L=model.smoothness,
+        smoothness_L=model.design_smoothness,
         num_stages=args.stages,
         num_chains=args.chains,
         num_ulmc_steps=args.steps,
@@ -810,8 +911,9 @@ def reference_samples(
             model.lattice_shape,
         )
 
-    transformed_smoothness = (
-        1.0 + 3.0 * model.quartic * model.radius**2 / model.mass
+    transformed_design_smoothness = (
+        1.0
+        + 3.0 * model.quartic * model.design_radius**2 / model.mass
     )
     reference_step_size = (
         args.step_size
@@ -819,12 +921,12 @@ def reference_samples(
         else args.reference_step_size
     )
     reference_stiffness_margin = (
-        reference_step_size * np.sqrt(transformed_smoothness)
+        reference_step_size * np.sqrt(transformed_design_smoothness)
     )
     if reference_stiffness_margin > 0.5:
         warnings.warn(
             "The reference sampler has "
-            f"h_ref * sqrt(L_ref)={reference_stiffness_margin:.3g}. "
+            f"h_ref * sqrt(L_ref,design)={reference_stiffness_margin:.3g}. "
             "Use --reference-step-size to reduce reference discretization "
             "error for this small-mass target.",
             RuntimeWarning,
@@ -836,16 +938,24 @@ def reference_samples(
         transformed_gradient,
         jnp.zeros(model.dimension, dtype=model.dtype),
         args.friction,
-        transformed_smoothness,
+        transformed_design_smoothness,
         reference_step_size,
         args.reference_steps,
         args.reference_chains,
     )
-    return _apply_spectrum_batch(
+    samples = _apply_spectrum_batch(
         latent_samples,
         sqrt_spectrum,
         model.lattice_shape,
     )
+    if not bool(jnp.all(jnp.isfinite(samples))):
+        target_name = "truncated" if model.is_truncated else "genuine quartic"
+        raise FloatingPointError(
+            f"The {target_name} reference run became nonfinite. Reduce "
+            "--reference-step-size (and the method --step-size), or increase "
+            "--cooling-design-radius for R=inf."
+        )
+    return samples
 
 
 def _safe_spectrum(
@@ -905,6 +1015,8 @@ def uniform_hessian_condition_bound(
 ) -> float:
     """Return the reference-free bound from the target's Hessian inequalities."""
 
+    if not model.is_truncated:
+        return np.inf
     spectrum = _safe_spectrum(spectrum, relative_floor).reshape(
         model.lattice_shape
     )
@@ -956,7 +1068,7 @@ def _write_preconditioned_site_series(
         )
 
     preconditioned_smoothness = max(
-        model.smoothness * float(np.max(spectrum)),
+        model.design_smoothness * float(np.max(spectrum)),
         1e-6,
     )
     key_position, key_momentum, key_steps = random.split(key, 3)
@@ -1330,6 +1442,9 @@ def run_experiment(args: argparse.Namespace) -> LatticeResult:
 
     dtype = jnp.float64 if args.dtype == "float64" else jnp.float32
     sides = np.asarray(args.sides, dtype=int)
+    diagnostic_side = int(
+        sides[-1] if args.diagnostic_side is None else args.diagnostic_side
+    )
     shape = (len(sides), args.repeats)
     relative_fourier = np.full(shape, np.nan)
     relative_dense = np.full(shape, np.nan)
@@ -1361,6 +1476,11 @@ def run_experiment(args: argparse.Namespace) -> LatticeResult:
             args.mass,
             args.radius,
             dtype,
+            design_radius=(
+                args.cooling_design_radius
+                if np.isposinf(args.radius)
+                else None
+            ),
         )
         validate_lattice_model(model)
         base_key = random.fold_in(root_key, side_index)
@@ -1543,7 +1663,8 @@ def run_experiment(args: argparse.Namespace) -> LatticeResult:
                 for method in FOUR_METHODS
             }
             initial_spectrum = (
-                np.ones(model.dimension, dtype=float) / model.smoothness
+                np.ones(model.dimension, dtype=float)
+                / model.design_smoothness
             )
             initial_condition = spectral_relative_condition(
                 initial_spectrum,
@@ -1623,7 +1744,7 @@ def run_experiment(args: argparse.Namespace) -> LatticeResult:
                         )
             comparison_conditions[side] = comparison
 
-        if side_index == len(sides) - 1:
+        if side == diagnostic_side:
             median_condition = np.median(relative_fourier[side_index])
             representative_index = int(
                 np.argmin(
@@ -1662,16 +1783,6 @@ def run_experiment(args: argparse.Namespace) -> LatticeResult:
                 args.metric_ridge,
             )
 
-    assert representative_spectrum is not None
-    diagnostic_side = int(sides[-1])
-    diagnostic_model = make_lattice_model(
-        diagnostic_side,
-        args.beta,
-        args.quartic,
-        args.mass,
-        args.radius,
-        dtype,
-    )
     if args.skip_diagnostics:
         distances = np.asarray([])
         covariance_row = np.asarray([])
@@ -1688,6 +1799,20 @@ def run_experiment(args: argparse.Namespace) -> LatticeResult:
         site_mean_z_scores = np.empty((0, 0))
         final_half_sample_count = 0
     else:
+        assert representative_spectrum is not None
+        diagnostic_model = make_lattice_model(
+            diagnostic_side,
+            args.beta,
+            args.quartic,
+            args.mass,
+            args.radius,
+            dtype,
+            design_radius=(
+                args.cooling_design_radius
+                if np.isposinf(args.radius)
+                else None
+            ),
+        )
         diagnostic_key = random.fold_in(root_key, 10_000)
         storage_bytes = (
             diagnostic_model.dimension
@@ -1775,8 +1900,9 @@ def _parameter_reference_arguments(
     """Return per-target reference settings with a fixed stability margin."""
 
     reference_args = argparse.Namespace(**vars(args))
-    transformed_smoothness = (
-        1.0 + 3.0 * model.quartic * model.radius**2 / model.mass
+    transformed_design_smoothness = (
+        1.0
+        + 3.0 * model.quartic * model.design_radius**2 / model.mass
     )
     requested_step_size = (
         args.step_size
@@ -1785,7 +1911,7 @@ def _parameter_reference_arguments(
     )
     stable_step_size = (
         args.parameter_sweep_reference_margin
-        / np.sqrt(transformed_smoothness)
+        / np.sqrt(transformed_design_smoothness)
     )
     reference_step_size = min(requested_step_size, stable_step_size)
     reference_args.reference_step_size = reference_step_size
@@ -1921,18 +2047,35 @@ def _evaluate_primary_methods(
         reference_spectrum,
         args.metric_floor,
     )
-    continuation_fraction = float(
-        np.mean(np.abs(np.asarray(reference)) > model.radius)
+    reference_array = np.asarray(reference)
+    continuation_fraction = (
+        float(np.mean(np.abs(reference_array) > model.radius))
+        if model.is_truncated
+        else np.nan
     )
+    design_exceedance_fraction = float(
+        np.mean(np.abs(reference_array) > model.design_radius)
+    )
+    if not model.is_truncated and design_exceedance_fraction > 0.01:
+        warnings.warn(
+            "More than 1% of the genuine-quartic reference coordinates "
+            f"exceeded R_design={model.design_radius:g}. Repeat with a "
+            "larger --cooling-design-radius and a smaller step size to "
+            "check tuning-scale sensitivity.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
     return _PrimaryMethodEvaluation(
         relative_conditions=relative_conditions,
         hessian_condition_bound=(
-            model.smoothness / model.strong_convexity
+            model.global_smoothness_bound / model.strong_convexity
         ),
         reference_condition=float(
             np.max(safe_reference) / np.min(safe_reference)
         ),
         continuation_fraction=continuation_fraction,
+        design_exceedance_fraction=design_exceedance_fraction,
+        reference_spectrum=reference_spectrum,
         reference_step_size=float(reference_args.reference_step_size),
         reference_steps=int(reference_args.reference_steps),
     )
@@ -1974,6 +2117,14 @@ def run_parameter_sweeps(
         name: np.empty(len(values), dtype=float)
         for name, values in sweep_specs.items()
     }
+    design_exceedance_fractions = {
+        name: np.empty(len(values), dtype=float)
+        for name, values in sweep_specs.items()
+    }
+    reference_spectra: dict[str, list[np.ndarray | None]] = {
+        name: [None] * len(values)
+        for name, values in sweep_specs.items()
+    }
     reference_step_sizes = {
         name: np.empty(len(values), dtype=float)
         for name, values in sweep_specs.items()
@@ -1987,7 +2138,7 @@ def run_parameter_sweeps(
     sweep_args.stages = args.parameter_sweep_stages
     root_key = random.fold_in(random.PRNGKey(args.seed), 300_000)
     cache: dict[
-        tuple[float, float, float],
+        tuple[float, float, float, float],
         _PrimaryMethodEvaluation,
     ] = {}
     started = time.perf_counter()
@@ -1995,7 +2146,7 @@ def run_parameter_sweeps(
     def configuration(
         sweep_name: str,
         value: float,
-    ) -> tuple[float, float, float]:
+    ) -> tuple[float, float, float, float]:
         quartic = (
             value
             if sweep_name == "quartic"
@@ -2011,7 +2162,17 @@ def run_parameter_sweeps(
             if sweep_name == "radius"
             else args.parameter_sweep_radius
         )
-        return (float(quartic), float(mass), float(radius))
+        design_radius = (
+            args.cooling_design_radius
+            if sweep_name == "radius"
+            else radius
+        )
+        return (
+            float(quartic),
+            float(mass),
+            float(radius),
+            float(design_radius),
+        )
 
     for sweep_name, values in sweep_specs.items():
         for value_index, value in enumerate(values):
@@ -2020,7 +2181,7 @@ def run_parameter_sweeps(
                 float(value),
             )
             if target_configuration not in cache:
-                quartic, mass, radius = target_configuration
+                quartic, mass, radius, design_radius = target_configuration
                 model = make_lattice_model(
                     args.parameter_sweep_side,
                     args.beta,
@@ -2028,6 +2189,7 @@ def run_parameter_sweeps(
                     mass,
                     radius,
                     dtype,
+                    design_radius=design_radius,
                 )
                 validate_lattice_model(model)
                 # Common random numbers pair every target configuration,
@@ -2036,7 +2198,8 @@ def run_parameter_sweeps(
                 print(
                     "Parameter sweep target "
                     f"{len(cache) + 1}: d={args.parameter_sweep_side}, "
-                    f"lambda={quartic:g}, m={mass:g}, R={radius:g}",
+                    f"lambda={quartic:g}, m={mass:g}, R={radius:g}, "
+                    f"R_design={design_radius:g}",
                     flush=True,
                 )
                 cache[target_configuration] = _evaluate_primary_methods(
@@ -2059,11 +2222,41 @@ def run_parameter_sweeps(
             continuation_fractions[sweep_name][value_index] = (
                 evaluation.continuation_fraction
             )
+            design_exceedance_fractions[sweep_name][value_index] = (
+                evaluation.design_exceedance_fraction
+            )
+            reference_spectra[sweep_name][value_index] = (
+                evaluation.reference_spectrum
+            )
             reference_step_sizes[sweep_name][value_index] = (
                 evaluation.reference_step_size
             )
             reference_steps[sweep_name][value_index] = (
                 evaluation.reference_steps
+            )
+
+    radius_values = sweep_specs["radius"]
+    truncation_to_quartic_conditions = np.full(
+        len(radius_values),
+        np.nan,
+        dtype=float,
+    )
+    quartic_indices = np.flatnonzero(np.isposinf(radius_values))
+    if quartic_indices.size:
+        quartic_spectrum = reference_spectra["radius"][
+            int(quartic_indices[0])
+        ]
+        assert quartic_spectrum is not None
+        for value_index, finite_spectrum in enumerate(
+            reference_spectra["radius"]
+        ):
+            assert finite_spectrum is not None
+            truncation_to_quartic_conditions[value_index] = (
+                spectral_relative_condition(
+                    finite_spectrum,
+                    quartic_spectrum,
+                    args.metric_floor,
+                )
             )
 
     return ParameterSweepResult(
@@ -2073,6 +2266,10 @@ def run_parameter_sweeps(
         hessian_condition_bounds=hessian_bounds,
         reference_conditions=reference_conditions,
         continuation_fractions=continuation_fractions,
+        design_exceedance_fractions=design_exceedance_fractions,
+        truncation_to_quartic_conditions=(
+            truncation_to_quartic_conditions
+        ),
         reference_step_sizes=reference_step_sizes,
         reference_steps=reference_steps,
         stages=args.parameter_sweep_stages,
@@ -2117,9 +2314,19 @@ def _phi4_parameter_subtitle(args: argparse.Namespace) -> str:
         if np.isclose(reference_step_size, args.step_size)
         else rf",\ h_{{\rm ref}}={reference_step_size:g}"
     )
+    radius_text = (
+        r"\infty" if np.isposinf(args.radius) else f"{args.radius:g}"
+    )
+    design_text = (
+        rf",\ R_{{\rm design}}={args.cooling_design_radius:g}"
+        if np.isposinf(args.radius)
+        else ""
+    )
     return (
         rf"$\beta={args.beta:g},\ \lambda={args.quartic:g},\ "
-        rf"m={args.mass:g},\ R={args.radius:g}$"
+        + rf"m={args.mass:g},\ R={radius_text}"
+        + design_text
+        + "$"
         + "\n"
         + rf"$n={args.chains},\ N={args.steps},\ K={args.stages},\ "
         rf"\gamma_{{\rm cool}}={args.cooling_gamma:g},\ "
@@ -2709,7 +2916,8 @@ def _parameter_sweep_subtitle(
     else:
         fixed_parameters = (
             rf"\lambda={args.parameter_sweep_quartic:g},\ "
-            rf"m={args.parameter_sweep_mass:g}"
+            rf"m={args.parameter_sweep_mass:g},\ "
+            rf"R_{{\rm design}}={args.cooling_design_radius:g}"
         )
     return (
         rf"$d={result.sweep_side},\ \beta={args.beta:g},\ "
@@ -2727,7 +2935,7 @@ def make_parameter_sweep_figures(
     result: ParameterSweepResult,
     args: argparse.Namespace,
 ) -> dict[str, plt.Figure]:
-    """Create three standalone four-method parameter-sweep figures."""
+    """Create standalone sweep and truncation-to-quartic figures."""
 
     _configure_plot_style()
     plot_metadata = {
@@ -2742,14 +2950,20 @@ def make_parameter_sweep_figures(
             "parameter_sweep_mass",
         ),
         "radius": (
-            r"Truncation radius $R$",
-            "Four-method comparison across truncation radius",
+            r"Target radius $R$ ($\infty$: genuine quartic)",
+            "Four-method comparison: truncated and genuine quartic targets",
             "parameter_sweep_radius",
         ),
     }
     figures: dict[str, plt.Figure] = {}
     for sweep_name, values in result.values.items():
         x_label, title, figure_name = plot_metadata[sweep_name]
+        is_radius_sweep = sweep_name == "radius"
+        plot_values = (
+            np.arange(len(values), dtype=float)
+            if is_radius_sweep
+            else values
+        )
         figure, ax = plt.subplots(
             figsize=(6.5, 4.9),
             constrained_layout=True,
@@ -2758,7 +2972,7 @@ def make_parameter_sweep_figures(
             color, marker, linestyle = METHOD_STYLES[method]
             _plot_median_iqr(
                 ax,
-                values,
+                plot_values,
                 result.relative_conditions[sweep_name][method],
                 color=color,
                 marker=marker,
@@ -2766,13 +2980,18 @@ def make_parameter_sweep_figures(
                 label=PLOT_LABELS[method],
             )
         ax.axhline(1.0, color="#222222", linestyle=":", linewidth=0.9)
-        ax.set_xscale("log")
+        if not is_radius_sweep:
+            ax.set_xscale("log")
         ax.set_yscale("log")
         ax.set_xticks(
-            values,
-            [f"{value:g}" for value in values],
+            plot_values,
+            [
+                r"$\infty$" if np.isposinf(value) else f"{value:g}"
+                for value in values
+            ],
         )
-        ax.xaxis.set_minor_formatter(NullFormatter())
+        if not is_radius_sweep:
+            ax.xaxis.set_minor_formatter(NullFormatter())
         ax.set_xlabel(x_label)
         ax.set_ylabel(r"Relative condition number $\kappa_{\mathrm{rel}}$")
         title_text = (
@@ -2780,9 +2999,13 @@ def make_parameter_sweep_figures(
             + "\n"
             + _parameter_sweep_subtitle(sweep_name, result, args)
         )
-        if sweep_name == "radius":
+        if is_radius_sweep:
             continuation_values = ", ".join(
-                f"{value:g}: {100.0 * fraction:.2g}%"
+                (
+                    r"$\infty$: n/a"
+                    if np.isposinf(value)
+                    else f"{value:g}: {100.0 * fraction:.2g}%"
+                )
                 for value, fraction in zip(
                     values,
                     result.continuation_fractions[sweep_name],
@@ -2812,6 +3035,46 @@ def make_parameter_sweep_figures(
             fontsize=7.4,
         )
         figures[figure_name] = figure
+
+    radius_conditions = result.truncation_to_quartic_conditions
+    if np.any(np.isfinite(radius_conditions)):
+        radius_values = result.values["radius"]
+        categorical_values = np.arange(len(radius_values), dtype=float)
+        figure, ax = plt.subplots(
+            figsize=(6.5, 4.5),
+            constrained_layout=True,
+        )
+        ax.plot(
+            categorical_values,
+            radius_conditions,
+            color=PURPLE,
+            marker="o",
+            linestyle="-",
+        )
+        ax.axhline(1.0, color="#222222", linestyle=":", linewidth=0.9)
+        ax.set_yscale("log")
+        ax.set_xticks(
+            categorical_values,
+            [
+                r"$\infty$" if np.isposinf(value) else f"{value:g}"
+                for value in radius_values
+            ],
+        )
+        ax.set_xlabel(r"Target radius $R$ ($\infty$: genuine quartic)")
+        ax.set_ylabel(
+            r"$\kappa_{\mathrm{rel}}(\Sigma_R,\Sigma_\infty)$"
+        )
+        ax.set_title(
+            "Reference-covariance convergence to the genuine quartic target\n"
+            + _parameter_sweep_subtitle("radius", result, args)
+        )
+        ax.grid(
+            which="major",
+            color="#D8D8D8",
+            linewidth=0.55,
+            alpha=0.8,
+        )
+        figures["truncation_to_quartic_covariance"] = figure
     return figures
 
 
@@ -2868,12 +3131,38 @@ def _parse_positive_values(value: str) -> list[float]:
     return sorted(values)
 
 
+def _parse_target_radii(value: str) -> list[float]:
+    """Parse distinct positive radii, allowing positive infinity."""
+
+    try:
+        radii = [
+            float(part.strip())
+            for part in value.split(",")
+            if part.strip()
+        ]
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "Expected comma-separated radii; use 'inf' for the genuine "
+            "quartic target."
+        ) from exc
+    if not radii or any(
+        item <= 0.0 or np.isnan(item) or np.isneginf(item)
+        for item in radii
+    ):
+        raise argparse.ArgumentTypeError(
+            "Target radii must be positive finite values or 'inf'."
+        )
+    if len(set(radii)) != len(radii):
+        raise argparse.ArgumentTypeError("Target radii must be unique.")
+    return sorted(radii)
+
+
 def build_parser() -> argparse.ArgumentParser:
     script_dir = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser(
         description=(
-            "Compare four covariance-preconditioning methods on a truncated "
-            "periodic lattice phi4 target."
+            "Compare four covariance-preconditioning methods on truncated "
+            "and genuine-quartic periodic lattice phi4 targets."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
@@ -2905,7 +3194,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--radius",
         type=float,
         default=2.0,
-        help="Quadratic-continuation radius R for the main experiment.",
+        help=(
+            "Quadratic-continuation radius R for the main experiment; use "
+            "'inf' for the genuine quartic target."
+        ),
+    )
+    parser.add_argument(
+        "--cooling-design-radius",
+        type=float,
+        default=4.0,
+        help=(
+            "Finite operational curvature radius used for R=inf and, for a "
+            "fair comparison, for every target in the radius sweep. It sets "
+            "stage zero and ULMC tuning but does not truncate the target."
+        ),
     )
     parser.add_argument(
         "--lambda-sweep-values",
@@ -2929,11 +3231,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--radius-sweep-values",
-        type=_parse_positive_values,
-        default=[0.5, 2.0, 4.0],
+        type=_parse_target_radii,
+        default=[0.5, 2.0, 4.0, np.inf],
         help=(
-            "Truncation radii for the controlled radius sweep. The fixed "
-            "lambda and mass are set by the parameter-sweep anchor."
+            "Target radii for the controlled comparison; use 'inf' for the "
+            "genuine quartic. All entries share --cooling-design-radius."
         ),
     )
     parser.add_argument(
@@ -3070,7 +3372,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=20,
         help=(
             "Largest side at which any full D-by-D covariance method is "
-            "formed; rank-deficient empirical covariances remain omitted."
+            "formed; use 0 to disable every dense/full-covariance path. "
+            "Rank-deficient empirical covariances remain omitted."
         ),
     )
     parser.add_argument(
@@ -3100,6 +3403,17 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=1024,
         help="Burn-in transitions for the post-cooling diagnostic chain.",
+    )
+    parser.add_argument(
+        "--diagnostic-side",
+        type=int,
+        default=None,
+        help=(
+            "Lattice side used for post-cooling IAT and ergodicity "
+            "diagnostics. By default use the largest requested side; the "
+            "--gpu preset skips diagnostics, or uses d=64 when explicitly "
+            "enabled."
+        ),
     )
     parser.add_argument(
         "--trajectory-samples",
@@ -3151,27 +3465,55 @@ def build_parser() -> argparse.ArgumentParser:
         default=271828,
         help="Root random seed.",
     )
-    parser.add_argument(
+    diagnostic_group = parser.add_mutually_exclusive_group()
+    diagnostic_group.add_argument(
         "--skip-diagnostics",
+        dest="skip_diagnostics",
         action="store_true",
         help=(
             "Skip the full covariance-row IAT and uncertainty-aware "
             "final-half mean diagnostics."
         ),
     )
-    parser.add_argument(
+    diagnostic_group.add_argument(
+        "--run-diagnostics",
+        dest="skip_diagnostics",
+        action="store_false",
+        help="Run diagnostics even when a preset would skip them.",
+    )
+    comparison_group = parser.add_mutually_exclusive_group()
+    comparison_group.add_argument(
         "--skip-comparisons",
         "--skip-stage-convergence",
         dest="skip_comparisons",
         action="store_true",
         help="Skip the separate stage-comparison plots.",
     )
-    parser.add_argument(
+    comparison_group.add_argument(
+        "--run-comparisons",
+        dest="skip_comparisons",
+        action="store_false",
+        help="Run stage comparisons even when a preset would skip them.",
+    )
+    sweep_group = parser.add_mutually_exclusive_group()
+    sweep_group.add_argument(
         "--skip-parameter-sweeps",
+        dest="skip_parameter_sweeps",
         action="store_true",
         help=(
             "Skip the controlled lambda, mass, and radius comparisons."
         ),
+    )
+    sweep_group.add_argument(
+        "--run-parameter-sweeps",
+        dest="skip_parameter_sweeps",
+        action="store_false",
+        help="Run parameter sweeps even when a preset would skip them.",
+    )
+    parser.set_defaults(
+        skip_diagnostics=False,
+        skip_comparisons=False,
+        skip_parameter_sweeps=False,
     )
     parser.add_argument(
         "--output-prefix",
@@ -3182,6 +3524,17 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Base output prefix; each plot name is appended and saved as a "
             "separate PDF."
+        ),
+    )
+    parser.add_argument(
+        "--gpu",
+        action="store_true",
+        help=(
+            "Require a JAX GPU backend and run the scalable lattice-size "
+            "feasibility test at sides 64,128,256,512,1024 using conservative "
+            "float32 budgets. Dense paths, diagnostics, stage comparisons, "
+            "and parameter sweeps are skipped unless explicitly enabled; "
+            "explicit numerical options override the preset."
         ),
     )
     parser.add_argument(
@@ -3238,7 +3591,7 @@ def apply_quick_configuration(
         "reference_steps": 48,
         "quartic_sweep_values": [0.5, 1.0],
         "mass_sweep_values": [0.05, 0.25],
-        "radius_sweep_values": [1.0, 2.0],
+        "radius_sweep_values": [1.0, 2.0, np.inf],
         "parameter_sweep_side": 4,
         "parameter_sweep_stages": 4,
         "parameter_sweep_reference_chains": 96,
@@ -3251,6 +3604,11 @@ def apply_quick_configuration(
         if destination not in explicitly_set:
             setattr(args, destination, value)
     if (
+        "cooling_design_radius" not in explicitly_set
+        and "radius_sweep_values" not in explicitly_set
+    ):
+        args.cooling_design_radius = 2.0
+    if (
         "sides" in explicitly_set
         and "comparison_sides" not in explicitly_set
     ):
@@ -3259,7 +3617,98 @@ def apply_quick_configuration(
         )
 
 
+def apply_gpu_configuration(
+    args: argparse.Namespace,
+    explicit_destinations: set[str] | None = None,
+) -> None:
+    """Apply the large-lattice GPU preset without overriding CLI choices."""
+
+    if not args.gpu:
+        return
+    explicitly_set = (
+        set()
+        if explicit_destinations is None
+        else explicit_destinations
+    )
+    gpu_values = {
+        "sides": list(GPU_LATTICE_SIDES),
+        "repeats": 1,
+        "chains": 64,
+        "steps": 32,
+        "stages": 8,
+        "reference_chains": 128,
+        "reference_steps": 128,
+        "dense_max_side": 0,
+        "parameter_sweep_side": 4,
+        "parameter_sweep_reference_chains": 128,
+        "skip_diagnostics": True,
+        "skip_comparisons": True,
+        "skip_parameter_sweeps": True,
+        "dtype": "float32",
+    }
+    for destination, value in gpu_values.items():
+        if destination not in explicitly_set:
+            setattr(args, destination, value)
+    if (
+        not args.skip_parameter_sweeps
+        and "dense_max_side" not in explicitly_set
+    ):
+        args.dense_max_side = args.parameter_sweep_side
+
+    moderate_sides = [
+        side for side in args.sides if side <= GPU_DIAGNOSTIC_MAX_SIDE
+    ]
+    if "diagnostic_side" not in explicitly_set:
+        if moderate_sides:
+            args.diagnostic_side = max(moderate_sides)
+        elif (
+            "skip_diagnostics" in explicitly_set
+            and not args.skip_diagnostics
+        ):
+            args.diagnostic_side = min(args.sides)
+        else:
+            args.skip_diagnostics = True
+
+    if "comparison_sides" not in explicitly_set:
+        args.comparison_sides = sorted(
+            {args.sides[0], args.sides[-1]}
+        )
+
+
+def _available_gpu_devices() -> list[object]:
+    """Return JAX GPU devices, with a focused error for backend failures."""
+
+    try:
+        devices = jax.devices()
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "JAX could not initialize its device backend while validating "
+            "--gpu. Check the CUDA-enabled JAX installation and driver."
+        ) from exc
+    gpu_platforms = {"gpu", "cuda", "rocm"}
+    return [
+        device
+        for device in devices
+        if str(device.platform).lower() in gpu_platforms
+    ]
+
+
 def validate_arguments(args: argparse.Namespace) -> None:
+    if args.gpu and not _available_gpu_devices():
+        raise RuntimeError(
+            "--gpu requires a JAX GPU backend, but no GPU device was found. "
+            "Install CUDA-enabled JAX and ensure the Pod exposes its GPU "
+            "before starting this experiment."
+        )
+    if args.gpu and args.dtype == "float64":
+        warnings.warn(
+            "The --gpu preset is sized for float32. Float64 approximately "
+            "doubles real state storage and should be enabled only after a "
+            "successful one-repeat memory benchmark.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
     counts = {
         "repeats": args.repeats,
         "chains": args.chains,
@@ -3294,7 +3743,7 @@ def validate_arguments(args: argparse.Namespace) -> None:
     positive_scalars = {
         "quartic": args.quartic,
         "mass": args.mass,
-        "radius": args.radius,
+        "cooling-design-radius": args.cooling_design_radius,
         "delta": args.delta,
         "friction": args.friction,
         "step-size": args.step_size,
@@ -3310,6 +3759,15 @@ def validate_arguments(args: argparse.Namespace) -> None:
             "These values must be finite and positive: "
             + ", ".join(invalid_positive)
             + "."
+        )
+    if (
+        args.radius <= 0.0
+        or np.isnan(args.radius)
+        or np.isneginf(args.radius)
+    ):
+        raise ValueError(
+            "--radius must be positive and finite, or 'inf' for the genuine "
+            "quartic target."
         )
     if (
         args.reference_step_size is not None
@@ -3367,6 +3825,27 @@ def validate_arguments(args: argparse.Namespace) -> None:
         )
     if args.parameter_sweep_side < 2:
         raise ValueError("--parameter-sweep-side must be at least two.")
+    if args.diagnostic_side is not None:
+        if args.diagnostic_side < 2:
+            raise ValueError("--diagnostic-side must be at least two.")
+        if args.diagnostic_side not in args.sides:
+            raise ValueError(
+                "--diagnostic-side must be included in --sides; got "
+                f"d={args.diagnostic_side}."
+            )
+    includes_genuine_quartic = np.isposinf(args.radius) or (
+        not args.skip_parameter_sweeps
+        and any(np.isposinf(value) for value in args.radius_sweep_values)
+    )
+    if includes_genuine_quartic:
+        warnings.warn(
+            "R=inf selects the genuine quartic target. Its Hessian is "
+            "unbounded, so --cooling-design-radius supplies only an "
+            "operational stage-zero/step-size scale; finite-global-L "
+            "Gaussian-cooling guarantees do not apply.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
     if not args.skip_parameter_sweeps:
         sweep_dimension = args.parameter_sweep_side**2
         if args.parameter_sweep_reference_chains < 4:
@@ -3385,11 +3864,26 @@ def validate_arguments(args: argparse.Namespace) -> None:
                 "--parameter-sweep-side <= --dense-max-side so the raw "
                 "full-covariance method is feasible."
             )
+        largest_finite_radius = max(
+            (
+                value
+                for value in args.radius_sweep_values
+                if np.isfinite(value)
+            ),
+            default=0.0,
+        )
+        if args.cooling_design_radius < largest_finite_radius:
+            raise ValueError(
+                "--cooling-design-radius must be at least the largest finite "
+                "--radius-sweep-values entry so it is a valid common "
+                "smoothness bound for every truncated comparison target."
+            )
         sweep_configurations = (
             [
                 (
                     value,
                     args.parameter_sweep_mass,
+                    args.parameter_sweep_radius,
                     args.parameter_sweep_radius,
                 )
                 for value in args.quartic_sweep_values
@@ -3399,6 +3893,7 @@ def validate_arguments(args: argparse.Namespace) -> None:
                     args.parameter_sweep_quartic,
                     value,
                     args.parameter_sweep_radius,
+                    args.parameter_sweep_radius,
                 )
                 for value in args.mass_sweep_values
             ]
@@ -3407,11 +3902,12 @@ def validate_arguments(args: argparse.Namespace) -> None:
                     args.parameter_sweep_quartic,
                     args.parameter_sweep_mass,
                     value,
+                    args.cooling_design_radius,
                 )
                 for value in args.radius_sweep_values
             ]
         )
-        max_smoothness = max(
+        max_design_smoothness = max(
             make_lattice_model(
                 args.parameter_sweep_side,
                 args.beta,
@@ -3419,11 +3915,12 @@ def validate_arguments(args: argparse.Namespace) -> None:
                 mass,
                 radius,
                 jnp.float32,
-            ).smoothness
-            for quartic, mass, radius in sweep_configurations
+                design_radius=design_radius,
+            ).design_smoothness
+            for quartic, mass, radius, design_radius in sweep_configurations
         )
         method_stiffness_margin = (
-            args.step_size * np.sqrt(max_smoothness)
+            args.step_size * np.sqrt(max_design_smoothness)
         )
         if method_stiffness_margin > 0.5:
             warnings.warn(
@@ -3649,6 +4146,7 @@ def print_parameter_sweep_summary(
             + "bound".rjust(11)
             + "ref kappa".rjust(12)
             + "outside %".rjust(12)
+            + ">Rdes %".rjust(10)
             + "h_ref".rjust(11)
             + "N_ref".rjust(8)
             + "cool".rjust(11)
@@ -3676,23 +4174,52 @@ def print_parameter_sweep_summary(
             continuation_percent = 100.0 * (
                 result.continuation_fractions[sweep_name][value_index]
             )
+            design_exceedance_percent = 100.0 * (
+                result.design_exceedance_fractions[sweep_name][value_index]
+            )
             reference_step_size = result.reference_step_sizes[
                 sweep_name
             ][value_index]
             reference_step_count = result.reference_steps[
                 sweep_name
             ][value_index]
+            continuation_text = (
+                "n/a".rjust(12)
+                if not np.isfinite(continuation_percent)
+                else f"{continuation_percent:>12.3g}"
+            )
             print(
                 f"{value:>8g}"
                 f"{condition_bound:>11.4g}"
                 f"{reference_condition:>12.4g}"
-                f"{continuation_percent:>12.3g}"
+                + continuation_text
+                + f"{design_exceedance_percent:>10.3g}"
                 f"{reference_step_size:>11.4g}"
                 f"{reference_step_count:>8d}"
                 f"{medians[COOLING_COMPARISON]:>11.4g}"
                 f"{medians[EMPIRICAL_COMPARISON]:>11.4g}"
                 f"{medians[TRANSLATION_AVERAGED_ULMC]:>11.4g}"
                 f"{medians[RAW_ULMC]:>11.4g}"
+            )
+        if sweep_name == "radius" and np.any(
+            np.isfinite(result.truncation_to_quartic_conditions)
+        ):
+            convergence_text = ", ".join(
+                (
+                    "inf"
+                    if np.isposinf(value)
+                    else f"{value:g}"
+                )
+                + f": {condition:.4g}"
+                for value, condition in zip(
+                    values,
+                    result.truncation_to_quartic_conditions,
+                    strict=True,
+                )
+            )
+            print(
+                "  reference kappa_rel(Sigma_R, Sigma_inf): "
+                + convergence_text
             )
     print(
         "\nParameter-sweep wall time (including compilation): "
@@ -3704,11 +4231,34 @@ def main(argv: Sequence[str] | None = None) -> None:
     arguments = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
     args = parser.parse_args(arguments)
+    if args.quick and args.gpu:
+        parser.error("--quick and --gpu are mutually exclusive presets.")
+    explicit_destinations = _explicit_cli_destinations(parser, arguments)
     apply_quick_configuration(
         args,
-        _explicit_cli_destinations(parser, arguments),
+        explicit_destinations,
     )
+    apply_gpu_configuration(args, explicit_destinations)
     validate_arguments(args)
+
+    if args.gpu:
+        gpu_devices = _available_gpu_devices()
+        device_names = ", ".join(
+            str(getattr(device, "device_kind", device))
+            for device in gpu_devices
+        )
+        diagnostic_text = (
+            "disabled"
+            if args.skip_diagnostics
+            else f"d={args.diagnostic_side}"
+        )
+        print(
+            "GPU large-lattice preset: "
+            f"devices={device_names}; sides={','.join(map(str, args.sides))}; "
+            f"n={args.chains}; N={args.steps}; K={args.stages}; "
+            f"diagnostics={diagnostic_text}",
+            flush=True,
+        )
 
     result = run_experiment(args)
     parameter_sweep_result = (
