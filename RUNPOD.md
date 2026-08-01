@@ -332,9 +332,14 @@ python -u experiment_truncated_phi4.py --gpu \
 
 The flag verifies that JAX sees a GPU, then runs sides 64, 128, 256, 512, and
 1024 with 64 chains, 128 reference chains, 32 transitions per stage, eight
-stages, one repeat, and float32. It disables dense matrices, diagnostics,
-stage comparisons, and parameter sweeps. Explicit flags override every preset
-value.
+stages, one repeat, and float32. It also writes stagewise-convergence plots for
+sides 512 and 1024. Those histories use only Fourier spectra and therefore
+remain linear in `D`, but they add separate runs for each of the three scalable
+methods. The full empirical covariance baseline is omitted because 64 samples
+give a rank-deficient covariance at these dimensions. The preset disables
+dense matrices, diagnostics, and parameter sweeps. Explicit flags override
+every preset value; add `--skip-comparisons` when only feasibility and timing
+matter, or use `--comparison-sides` to select different history sizes.
 
 If the first run fits comfortably, increase precision deliberately, for
 example:
@@ -356,7 +361,7 @@ sizes. A dense `D`-by-`D` float32 matrix would require 4 TiB, which is why the
 preset disables every dense path. Each method also executes one unmeasured
 warmup before its requested repeat.
 
-Run the smaller, qualitatively different outputs separately:
+Run smaller, qualitatively different outputs separately when needed:
 
 ```bash
 # Stage comparisons; raw full covariance appears only where rank/size permit.

@@ -88,6 +88,11 @@ MARKERS = {
     "K-stage empirical preconditioning": "s",
     "Unpreconditioned ULMC": "^",
 }
+PLOT_LABELS = {
+    "Gaussian cooling": "Gaussian cooling",
+    "K-stage empirical preconditioning": "Empirical preconditioning",
+    "Unpreconditioned ULMC": "Unpreconditioned ULMC",
+}
 
 
 @dataclass(frozen=True)
@@ -753,7 +758,7 @@ def make_figures(
             color=COLORS[method],
             marker=MARKERS[method],
             markersize=4.5,
-            label=method,
+            label=PLOT_LABELS[method],
         )
     ax.axhline(1.0, color="#222222", linewidth=0.9, linestyle=":", zorder=0)
     ax.set_xscale("log")
@@ -761,15 +766,18 @@ def make_figures(
     ax.set_xlabel(r"Transformation condition number $\kappa(B)$")
     ax.set_ylabel(r"Relative condition number $\kappa_{\mathrm{rel}}$")
     ax.set_title(
-        "Preconditioner quality under affine transformations\n"
+        "Preconditioner quality for a transformed Gaussian\n"
         rf"$\kappa(\Sigma_0)={result.base_condition_number:g}$, "
         rf"$d={dimension}$, $n={num_chains}$, $N={num_steps}$, "
-        rf"$K={num_stages}$" + "\n" + rf"$\gamma_{{\rm cool}}={cooling_gamma:g}$, "
-        rf"$h={step_size:g}$, "
-        rf"$\gamma_{{\rm fric}}={friction:g}$"
+        rf"$K={num_stages}$"
     )
     ax.grid(which="major", color="#D8D8D8", linewidth=0.55, alpha=0.8)
-    ax.legend(frameon=False, loc="upper left")
+    ax.legend(
+        frameon=False,
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.2),
+        ncols=2,
+    )
 
     convergence_figure, ax = plt.subplots(
         figsize=(4.7, 3.8),
@@ -794,7 +802,7 @@ def make_figures(
             color=COLORS[method],
             marker=MARKERS[method],
             markersize=3.7,
-            label=method,
+            label=PLOT_LABELS[method],
         )
     ax.plot(
         stages,
@@ -802,24 +810,28 @@ def make_figures(
         color="#222222",
         linestyle="--",
         linewidth=1.25,
-        label="Exact Gaussian cooling (oracle)",
+        label="Exact cooling oracle",
     )
     ax.axhline(1.0, color="#222222", linewidth=0.9, linestyle=":", zorder=0)
     ax.set_yscale("log")
-    ax.set_xlabel("Cumulative stages")
+    ax.set_xlabel(r"Stage $k$")
     ax.set_ylabel(r"Relative condition number $\kappa_{\mathrm{rel}}$")
     ax.set_title(
-        "Hardest-case convergence\n"
+        "Stagewise convergence at the largest transformation\n"
         rf"$\kappa(\Sigma_0)={result.base_condition_number:g}$, "
         rf"$\kappa(B)={result.kappas[-1]:g}$, "
         rf"$\kappa(\Sigma_B)={result.target_conditions[-1]:.3g}$" + "\n"
         rf"$d={dimension}$, $n={num_chains}$, $N={num_steps}$, "
-        rf"$K={num_stages}$" + "\n" + rf"$\gamma_{{\rm cool}}={cooling_gamma:g}$, "
-        rf"$h={step_size:g}$, "
-        rf"$\gamma_{{\rm fric}}={friction:g}$"
+        rf"$K={num_stages}$"
     )
     ax.grid(which="major", color="#D8D8D8", linewidth=0.55, alpha=0.8)
-    ax.legend(frameon=False, loc="upper right", fontsize=7.7)
+    ax.legend(
+        frameon=False,
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.2),
+        ncols=2,
+        fontsize=7.7,
+    )
 
     return {
         "preconditioner_quality": quality_figure,

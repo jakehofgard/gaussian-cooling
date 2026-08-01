@@ -39,6 +39,16 @@ quartic this operational radius is a tuning scale, not a global Hessian
 bound: the quartic Hessian is unbounded and the finite-smoothness theory does
 not apply.  Each sweep is saved as its own vector PDF.
 
+``--hardness-map`` selects a separate scalable test with ``R=4`` and
+``beta=2``. Its horizontal axis is mass, its vertical axis is quartic
+coupling, and it emits separate absolute-quality and adaptive-gain PDFs for
+each requested side ``d``. Every cell uses the same practitioner-selected
+budgets (by default ``n=512``, ``N=128``, and ``K=12``), so changes across
+the map reflect target geometry and lattice size rather than a changing
+compute allocation. The ambient field dimension ``D=d**2`` is reported
+separately. Only the three Fourier methods are included because the raw full
+covariance is rank-deficient or prohibitively dense at the intended sides.
+
 The script exposes step size, friction, sample count, transition count, and
 stage count directly. ``--delta`` records the theoretical preconditioning
 tolerance but does not otherwise alter a fixed-budget recurrence.
@@ -57,7 +67,8 @@ After cooling the selected diagnostic lattice, a serial preconditioned ULMC
 trajectory is used for two sampling diagnostics. The largest requested side
 is used ordinarily. The ``--gpu`` scaling preset skips these diagnostics by
 default while extending the scalable comparisons through side 1024; an
-explicit opt-in uses side 64. ``emcee`` estimates the integrated
+explicit opt-in uses side 64. The preset also produces standalone stagewise
+convergence plots at sides 512 and 1024. ``emcee`` estimates the integrated
 autocorrelation time of every entry in the first sample-covariance row, using
 ``g_x(t) = (phi_t(0) - phi_bar(0)) (phi_t(x) - phi_bar(x))``.
 The resulting plot contains every lattice site and displays mixing versus
@@ -80,6 +91,10 @@ Production defaults:
 H100-scale defaults through side 1024:
 
     python experiment_truncated_phi4.py --gpu
+
+Separate fixed-R, fixed-beta hardness map through side 128:
+
+    python experiment_truncated_phi4.py --hardness-map
 """
 
 from __future__ import annotations
@@ -135,7 +150,10 @@ PURPLE = "#CC79A7"
 GRAY = "#6B6B6B"
 
 GPU_LATTICE_SIDES = (64, 128, 256, 512, 1024)
+GPU_STAGE_COMPARISON_SIDES = (512, 1024)
 GPU_DIAGNOSTIC_MAX_SIDE = 100
+HARDNESS_BETA = 2.0
+HARDNESS_RADIUS = 4.0
 
 COOLING_COMPARISON = "Translation-invariant Gaussian cooling"
 EMPIRICAL_COMPARISON = (
@@ -149,6 +167,11 @@ FOUR_METHODS = (
     EMPIRICAL_COMPARISON,
     TRANSLATION_AVERAGED_ULMC,
     RAW_ULMC,
+)
+SCALABLE_METHODS = (
+    COOLING_COMPARISON,
+    EMPIRICAL_COMPARISON,
+    TRANSLATION_AVERAGED_ULMC,
 )
 METHOD_STYLES = {
     COOLING_COMPARISON: (BLUE, "o", "-"),
@@ -258,6 +281,27 @@ class ParameterSweepResult:
 
 
 @dataclass
+class HardnessMapResult:
+    """Scalable ``(mass, quartic coupling)`` maps at several lattice sides."""
+
+    sides: np.ndarray
+    masses: np.ndarray
+    quartics: np.ndarray
+    relative_conditions: dict[str, np.ndarray]
+    hessian_condition_bounds: np.ndarray
+    chains: int
+    steps: int
+    reference_conditions: np.ndarray
+    reference_split_conditions: np.ndarray
+    reference_chains: np.ndarray
+    reference_step_sizes: np.ndarray
+    reference_steps: np.ndarray
+    stages: int
+    repeats: int
+    elapsed_seconds: float
+
+
+@dataclass
 class _PrimaryMethodEvaluation:
     """Four-method output for one lattice target in a parameter sweep."""
 
@@ -267,6 +311,18 @@ class _PrimaryMethodEvaluation:
     continuation_fraction: float
     design_exceedance_fraction: float
     reference_spectrum: np.ndarray
+    reference_step_size: float
+    reference_steps: int
+
+
+@dataclass
+class _HardnessCellEvaluation:
+    """Three scalable-method estimates and reference metadata for one cell."""
+
+    relative_conditions: dict[str, np.ndarray]
+    reference_condition: float
+    reference_split_condition: float
+    reference_chains: int
     reference_step_size: float
     reference_steps: int
 
@@ -787,8 +843,16 @@ def _fourier_stage_history(
     )
     history: list[Array] = [spectrum]
     for stage_index in range(1, args.stages + 1):
-        key, stage_key = random.split(key)
+        # Give the one-stage call the same parent key used by the corresponding
+        # iteration of the full K-stage scan.  Advancing the outer key to the
+        # first child then reproduces the scan's PRNG recurrence exactly.
+        stage_key = key
+        key, _ = random.split(key)
         if use_cooling:
+            stage_cooling_gamma = jnp.power(
+                jnp.asarray(args.cooling_gamma, dtype=model.dtype),
+                stage_index,
+            )
             spectrum = translation_invariant_gaussian_cooling(
                 stage_key,
                 model.potential,
@@ -796,7 +860,7 @@ def _fourier_stage_history(
                 jnp.zeros(model.dimension, dtype=model.dtype),
                 alpha=model.design_conditioning_alpha,
                 delta=args.delta,
-                cooling_gamma=args.cooling_gamma**stage_index,
+                cooling_gamma=stage_cooling_gamma,
                 smoothness_L=model.design_smoothness,
                 num_stages=1,
                 num_chains=args.chains,
@@ -849,7 +913,7 @@ def _run_timed_repeats(
     keys: Sequence[Array],
     warmup_key: Array,
 ) -> tuple[list[np.ndarray], np.ndarray]:
-    """Return synchronized outputs and wall times for cached JAX executions."""
+    """Return synchronized outputs and post-compilation JAX wall times."""
 
     call(warmup_key).block_until_ready()
 
@@ -1654,7 +1718,7 @@ def run_experiment(args: argparse.Namespace) -> LatticeResult:
 
         if side in comparison_sides:
             print(
-                "  Stage comparison: four equal-budget preconditioners",
+                "  Stage comparison: equal-budget preconditioner histories",
                 flush=True,
             )
             stage_shape = (args.stages + 1, args.repeats)
@@ -1951,22 +2015,18 @@ def _evaluate_primary_methods(
     plain_warm_key, plain_run_root = random.split(plain_root)
     plain_keys = list(random.split(plain_run_root, args.repeats))
 
-    cooling_call = lambda run_key: _fourier_cooling_call(
-        run_key,
-        model,
-        args,
-    )
+    def cooling_call(run_key: Array) -> Array:
+        return _fourier_cooling_call(run_key, model, args)
+
     cooling_spectra, _ = _run_timed_repeats(
         cooling_call,
         adaptive_keys,
         adaptive_warm_key,
     )
 
-    empirical_call = lambda run_key: _fourier_empirical_baseline_call(
-        run_key,
-        model,
-        args,
-    )
+    def empirical_call(run_key: Array) -> Array:
+        return _fourier_empirical_baseline_call(run_key, model, args)
+
     empirical_spectra, _ = _run_timed_repeats(
         empirical_call,
         adaptive_keys,
@@ -2078,6 +2138,316 @@ def _evaluate_primary_methods(
         reference_spectrum=reference_spectrum,
         reference_step_size=float(reference_args.reference_step_size),
         reference_steps=int(reference_args.reference_steps),
+    )
+
+
+def _hardness_budget(
+    model: LatticeModel,
+    args: argparse.Namespace,
+) -> tuple[float, int, int]:
+    """Return ``(kappa_H, n, N)`` for one fixed-budget map target.
+
+    ``kappa_H=L/m`` is the uniform Hessian condition bound. The chain and
+    transition counts are held fixed across lattice sizes and parameter cells
+    to compare methods at the same practitioner-selected compute budget.
+    """
+
+    condition_bound = (
+        model.global_smoothness_bound / model.strong_convexity
+    )
+    return (
+        float(condition_bound),
+        int(args.hardness_chains),
+        int(args.hardness_steps),
+    )
+
+
+def _hardness_reference_arguments(
+    model: LatticeModel,
+    method_chains: int,
+    args: argparse.Namespace,
+) -> argparse.Namespace:
+    """Build stable, independently controlled reference-sampler settings."""
+
+    reference_args = argparse.Namespace(**vars(args))
+    transformed_smoothness = (
+        1.0
+        + 3.0 * model.quartic * model.radius**2 / model.mass
+    )
+    stable_step_size = (
+        args.hardness_reference_margin
+        / np.sqrt(transformed_smoothness)
+    )
+    reference_step_size = min(
+        args.hardness_reference_max_step,
+        stable_step_size,
+    )
+    reference_args.reference_step_size = reference_step_size
+    reference_args.reference_steps = max(
+        1,
+        int(
+            np.ceil(
+                args.hardness_reference_time / reference_step_size
+            )
+        ),
+    )
+    reference_args.reference_chains = max(
+        args.hardness_reference_min_chains,
+        int(
+            np.ceil(
+                args.hardness_reference_chain_factor * method_chains
+            )
+        ),
+    )
+    return reference_args
+
+
+def _evaluate_hardness_cell(
+    key: Array,
+    model: LatticeModel,
+    args: argparse.Namespace,
+) -> _HardnessCellEvaluation:
+    """Evaluate the three O(D)-storage methods at one map cell."""
+
+    adaptive_root, plain_root, reference_key = random.split(key, 3)
+    adaptive_warm_key, adaptive_run_root = random.split(adaptive_root)
+    adaptive_keys = list(
+        random.split(adaptive_run_root, args.hardness_repeats)
+    )
+    plain_warm_key, plain_run_root = random.split(plain_root)
+    plain_keys = list(
+        random.split(plain_run_root, args.hardness_repeats)
+    )
+
+    def cooling_call(run_key: Array) -> Array:
+        return _fourier_cooling_call(run_key, model, args)
+
+    cooling_spectra, _ = _run_timed_repeats(
+        cooling_call,
+        adaptive_keys,
+        adaptive_warm_key,
+    )
+
+    def empirical_call(run_key: Array) -> Array:
+        return _fourier_empirical_baseline_call(run_key, model, args)
+
+    empirical_spectra, _ = _run_timed_repeats(
+        empirical_call,
+        adaptive_keys,
+        adaptive_warm_key,
+    )
+
+    def plain_call(run_key: Array) -> Array:
+        return _translation_averaged_ulmc_call(run_key, model, args)
+
+    plain_spectra, _ = _run_timed_repeats(
+        plain_call,
+        plain_keys,
+        plain_warm_key,
+    )
+
+    reference_args = _hardness_reference_arguments(
+        model,
+        args.chains,
+        args,
+    )
+    reference = reference_samples(reference_key, model, reference_args)
+    reference.block_until_ready()
+    reference_spectrum = np.asarray(
+        sample_power_spectrum(reference, model.lattice_shape)
+    )
+    reference_midpoint = reference.shape[0] // 2
+    first_reference_spectrum = np.asarray(
+        sample_power_spectrum(
+            reference[:reference_midpoint],
+            model.lattice_shape,
+        )
+    )
+    second_reference_spectrum = np.asarray(
+        sample_power_spectrum(
+            reference[reference_midpoint:],
+            model.lattice_shape,
+        )
+    )
+    reference_split_condition = spectral_relative_condition(
+        first_reference_spectrum,
+        second_reference_spectrum,
+        args.metric_floor,
+    )
+    safe_reference = _safe_spectrum(
+        reference_spectrum,
+        args.metric_floor,
+    )
+    spectra_by_method = {
+        COOLING_COMPARISON: cooling_spectra,
+        EMPIRICAL_COMPARISON: empirical_spectra,
+        TRANSLATION_AVERAGED_ULMC: plain_spectra,
+    }
+    relative_conditions = {
+        method: np.asarray(
+            [
+                spectral_relative_condition(
+                    spectrum,
+                    reference_spectrum,
+                    args.metric_floor,
+                )
+                for spectrum in spectra
+            ],
+            dtype=float,
+        )
+        for method, spectra in spectra_by_method.items()
+    }
+    return _HardnessCellEvaluation(
+        relative_conditions=relative_conditions,
+        reference_condition=float(
+            np.max(safe_reference) / np.min(safe_reference)
+        ),
+        reference_split_condition=reference_split_condition,
+        reference_chains=int(reference_args.reference_chains),
+        reference_step_size=float(reference_args.reference_step_size),
+        reference_steps=int(reference_args.reference_steps),
+    )
+
+
+def run_hardness_map(args: argparse.Namespace) -> HardnessMapResult:
+    """Run the separate fixed-``R``, fixed-``beta`` hardness-map test."""
+
+    dtype = jnp.float64 if args.dtype == "float64" else jnp.float32
+    sides = np.asarray(args.hardness_sides, dtype=int)
+    masses = np.asarray(args.hardness_masses, dtype=float)
+    quartics = np.asarray(args.hardness_quartics, dtype=float)
+    shape = (
+        len(sides),
+        len(quartics),
+        len(masses),
+        args.hardness_repeats,
+    )
+    relative_conditions = {
+        method: np.empty(shape, dtype=float)
+        for method in SCALABLE_METHODS
+    }
+    cell_shape = shape[:-1]
+    condition_bounds = np.empty(cell_shape, dtype=float)
+    reference_conditions = np.empty(cell_shape, dtype=float)
+    reference_split_conditions = np.empty(cell_shape, dtype=float)
+    reference_chains = np.empty(cell_shape, dtype=int)
+    reference_step_sizes = np.empty(cell_shape, dtype=float)
+    reference_steps = np.empty(cell_shape, dtype=int)
+
+    root_key = random.fold_in(random.PRNGKey(args.seed), 400_000)
+    started = time.perf_counter()
+    num_cells_per_side = len(quartics) * len(masses)
+    for side_index, side_value in enumerate(sides):
+        side = int(side_value)
+        for quartic_index, quartic in enumerate(quartics):
+            for mass_index, mass in enumerate(masses):
+                model = make_lattice_model(
+                    side,
+                    HARDNESS_BETA,
+                    float(quartic),
+                    float(mass),
+                    HARDNESS_RADIUS,
+                    dtype,
+                )
+                validate_lattice_model(model)
+                condition, num_chains, num_steps = _hardness_budget(
+                    model,
+                    args,
+                )
+                condition_bounds[
+                    side_index,
+                    quartic_index,
+                    mass_index,
+                ] = condition
+                cell_args = argparse.Namespace(**vars(args))
+                cell_args.chains = num_chains
+                cell_args.steps = num_steps
+                cell_args.stages = args.hardness_stages
+                flat_cell_index = (
+                    side_index * num_cells_per_side
+                    + quartic_index * len(masses)
+                    + mass_index
+                )
+                cell_key = random.fold_in(root_key, flat_cell_index)
+                print(
+                    "Hardness cell: "
+                    f"side={side} (D={model.dimension}), "
+                    f"m={mass:g}, lambda={quartic:g}, "
+                    f"kappa_H={condition:.4g}, n={num_chains}, "
+                    f"N={num_steps}, K={args.hardness_stages}",
+                    flush=True,
+                )
+                evaluation = _evaluate_hardness_cell(
+                    cell_key,
+                    model,
+                    cell_args,
+                )
+                for method in SCALABLE_METHODS:
+                    relative_conditions[method][
+                        side_index,
+                        quartic_index,
+                        mass_index,
+                    ] = evaluation.relative_conditions[method]
+                reference_conditions[
+                    side_index,
+                    quartic_index,
+                    mass_index,
+                ] = evaluation.reference_condition
+                reference_split_conditions[
+                    side_index,
+                    quartic_index,
+                    mass_index,
+                ] = evaluation.reference_split_condition
+                reference_chains[
+                    side_index,
+                    quartic_index,
+                    mass_index,
+                ] = evaluation.reference_chains
+                reference_step_sizes[
+                    side_index,
+                    quartic_index,
+                    mass_index,
+                ] = evaluation.reference_step_size
+                reference_steps[
+                    side_index,
+                    quartic_index,
+                    mass_index,
+                ] = evaluation.reference_steps
+
+    maximum_reference_disagreement = float(
+        np.max(reference_split_conditions)
+    )
+    if (
+        not args.quick
+        and maximum_reference_disagreement
+        > args.hardness_reference_consistency_threshold
+    ):
+        warnings.warn(
+            "The maximum half-sample reference consistency condition is "
+            f"{maximum_reference_disagreement:.3g}, above "
+            f"{args.hardness_reference_consistency_threshold:g}. Increase "
+            "the hardness reference time and chain settings before "
+            "interpreting method differences.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
+    return HardnessMapResult(
+        sides=sides,
+        masses=masses,
+        quartics=quartics,
+        relative_conditions=relative_conditions,
+        hessian_condition_bounds=condition_bounds,
+        chains=args.hardness_chains,
+        steps=args.hardness_steps,
+        reference_conditions=reference_conditions,
+        reference_split_conditions=reference_split_conditions,
+        reference_chains=reference_chains,
+        reference_step_sizes=reference_step_sizes,
+        reference_steps=reference_steps,
+        stages=args.hardness_stages,
+        repeats=args.hardness_repeats,
+        elapsed_seconds=time.perf_counter() - started,
     )
 
 
@@ -2302,18 +2672,8 @@ def _configure_plot_style() -> None:
 
 
 def _phi4_parameter_subtitle(args: argparse.Namespace) -> str:
-    """Return target and cooling parameters shown on every phi4 plot."""
+    """Return concise target and method-budget metadata for phi4 plots."""
 
-    reference_step_size = (
-        args.step_size
-        if args.reference_step_size is None
-        else args.reference_step_size
-    )
-    reference_step_text = (
-        ""
-        if np.isclose(reference_step_size, args.step_size)
-        else rf",\ h_{{\rm ref}}={reference_step_size:g}"
-    )
     radius_text = (
         r"\infty" if np.isposinf(args.radius) else f"{args.radius:g}"
     )
@@ -2326,14 +2686,7 @@ def _phi4_parameter_subtitle(args: argparse.Namespace) -> str:
         rf"$\beta={args.beta:g},\ \lambda={args.quartic:g},\ "
         + rf"m={args.mass:g},\ R={radius_text}"
         + design_text
-        + "$"
-        + "\n"
-        + rf"$n={args.chains},\ N={args.steps},\ K={args.stages},\ "
-        rf"\gamma_{{\rm cool}}={args.cooling_gamma:g},\ "
-        rf"h={args.step_size:g},\ "
-        rf"\gamma_{{\rm fric}}={args.friction:g}"
-        + reference_step_text
-        + "$"
+        + rf";\ n={args.chains},\ N={args.steps},\ K={args.stages}$"
     )
 
 
@@ -2349,14 +2702,6 @@ def _plot_median_iqr(
 ) -> None:
     valid_rows = np.any(np.isfinite(values), axis=1)
     if not np.any(valid_rows):
-        ax.plot(
-            [],
-            [],
-            color=color,
-            marker=marker,
-            linestyle=linestyle,
-            label=label,
-        )
         return
     x_valid = x[valid_rows]
     data = values[valid_rows]
@@ -2427,33 +2772,12 @@ def make_figures(
     )
     ax.grid(which="major", color="#D8D8D8", linewidth=0.55, alpha=0.8)
     ax.legend(
-        frameon=True,
-        facecolor="white",
-        framealpha=0.88,
-        edgecolor="none",
+        frameon=False,
         loc="upper center",
         bbox_to_anchor=(0.5, -0.24),
         ncols=2,
         fontsize=7.4,
     )
-    if result.raw_ulmc_skip_reasons:
-        ax.text(
-            0.98,
-            0.13,
-            "Full covariance omitted where rank deficient\n"
-            "or beyond the full-covariance cutoff",
-            transform=ax.transAxes,
-            ha="right",
-            va="bottom",
-            color=GRAY,
-            fontsize=7.5,
-            bbox={
-                "facecolor": "white",
-                "edgecolor": "none",
-                "alpha": 0.78,
-                "pad": 1.5,
-            },
-        )
     figures["preconditioner_quality"] = quality_figure
 
     runtime_figure, ax = plt.subplots(
@@ -2483,39 +2807,18 @@ def make_figures(
     ax.set_xscale("log")
     ax.set_yscale("log")
     ax.set_xlabel(r"Number of lattice sites $D=d^2$")
-    ax.set_ylabel("Cached wall time (s)")
+    ax.set_ylabel("Wall time after JIT compilation (s)")
     ax.set_title(
         "Covariance-estimation cost\n" + _phi4_parameter_subtitle(args)
     )
     ax.grid(which="major", color="#D8D8D8", linewidth=0.55, alpha=0.8)
     ax.legend(
-        frameon=True,
-        facecolor="white",
-        framealpha=0.88,
-        edgecolor="none",
+        frameon=False,
         loc="upper center",
         bbox_to_anchor=(0.5, -0.24),
         ncols=2,
         fontsize=7.4,
     )
-    if result.raw_ulmc_skip_reasons:
-        ax.text(
-            0.98,
-            0.05,
-            "Full covariance omitted where rank deficient\n"
-            "or beyond the full-covariance cutoff",
-            transform=ax.transAxes,
-            ha="right",
-            va="bottom",
-            color=GRAY,
-            fontsize=7.8,
-            bbox={
-                "facecolor": "white",
-                "edgecolor": "none",
-                "alpha": 0.78,
-                "pad": 1.5,
-            },
-        )
     figures["covariance_estimation_cost"] = runtime_figure
 
     if np.any(np.isfinite(result.relative_condition_dense)):
@@ -2554,11 +2857,10 @@ def make_figures(
         )
         ax.grid(which="major", color="#D8D8D8", linewidth=0.55, alpha=0.8)
         ax.legend(
-            frameon=True,
-            facecolor="white",
-            framealpha=0.88,
-            edgecolor="none",
-            loc="best",
+            frameon=False,
+            loc="upper center",
+            bbox_to_anchor=(0.5, -0.22),
+            ncols=2,
             fontsize=7.6,
         )
         figures["dense_cooling_quality"] = dense_quality_figure
@@ -2588,29 +2890,34 @@ def make_figures(
         ax.set_xscale("log")
         ax.set_yscale("log")
         ax.set_xlabel(r"Number of lattice sites $D=d^2$")
-        ax.set_ylabel("Cached wall time (s)")
+        ax.set_ylabel("Wall time after JIT compilation (s)")
         ax.set_title(
             "Dense Gaussian-cooling cost\n"
             + _phi4_parameter_subtitle(args)
         )
         ax.grid(which="major", color="#D8D8D8", linewidth=0.55, alpha=0.8)
         ax.legend(
-            frameon=True,
-            facecolor="white",
-            framealpha=0.88,
-            edgecolor="none",
-            loc="best",
+            frameon=False,
+            loc="upper center",
+            bbox_to_anchor=(0.5, -0.22),
+            ncols=2,
             fontsize=7.6,
         )
         figures["dense_cooling_cost"] = dense_runtime_figure
 
     stages = np.arange(args.stages + 1)
     for side, comparison in sorted(result.comparison_conditions.items()):
+        raw_reason = result.raw_ulmc_skip_reasons.get(side)
+        plotted_methods = [
+            method
+            for method in FOUR_METHODS
+            if method != RAW_ULMC or raw_reason is None
+        ]
         comparison_figure, ax = plt.subplots(
             figsize=(6.6, 4.9),
             constrained_layout=True,
         )
-        for method in FOUR_METHODS:
+        for method in plotted_methods:
             color, marker, linestyle = METHOD_STYLES[method]
             _plot_median_iqr(
                 ax,
@@ -2624,46 +2931,21 @@ def make_figures(
         ax.axhline(1.0, color="#222222", linestyle=":", linewidth=0.9)
         ax.set_yscale("log")
         ax.xaxis.set_major_locator(MaxNLocator(integer=True, nbins=7))
-        ax.set_xlabel(
-            r"Cumulative stage budget $k$ "
-            r"(plain ULMC uses $kN$ transitions)"
-        )
+        ax.set_xlabel(r"Cumulative stage $k$")
         ax.set_ylabel(r"Relative condition number $\kappa_{\mathrm{rel}}$")
         ax.set_title(
-            rf"Four-method preconditioner comparison, $d={side}$"
+            rf"Stagewise preconditioner convergence, $d={side}$"
             + "\n"
             + _phi4_parameter_subtitle(args)
         )
         ax.grid(which="major", color="#D8D8D8", linewidth=0.55, alpha=0.8)
         ax.legend(
-            frameon=True,
-            facecolor="white",
-            framealpha=0.88,
-            edgecolor="none",
+            frameon=False,
             loc="upper center",
             bbox_to_anchor=(0.5, -0.24),
             fontsize=7.2,
             ncols=2,
         )
-        raw_reason = result.raw_ulmc_skip_reasons.get(side)
-        if raw_reason is not None:
-            ax.text(
-                0.98,
-                0.12,
-                f"Full empirical covariance unavailable after stage 0:\n"
-                f"{raw_reason}",
-                transform=ax.transAxes,
-                ha="right",
-                va="bottom",
-                color=GRAY,
-                fontsize=7.3,
-                bbox={
-                    "facecolor": "white",
-                    "edgecolor": "none",
-                    "alpha": 0.78,
-                    "pad": 1.5,
-                },
-            )
         figures[f"stage_comparison_d{side}"] = comparison_figure
 
     if result.autocorrelation_times.size:
@@ -2688,7 +2970,7 @@ def make_figures(
                 alpha=0.22,
                 linewidth=0,
                 rasterized=True,
-                label=rf"Reliable ($T\geq {result.iat_tolerance}\tau_{{\rm int}}$)",
+                label="IAT criterion met",
             )
         if np.any(unreliable):
             ax.scatter(
@@ -2700,7 +2982,7 @@ def make_figures(
                 alpha=0.28,
                 linewidth=0.45,
                 rasterized=True,
-                label=rf"Short chain ($T<{result.iat_tolerance}\tau_{{\rm int}}$)",
+                label="Short-chain estimate",
             )
 
         radial_bins = np.floor(distances[finite]).astype(int)
@@ -2757,34 +3039,20 @@ def make_figures(
             r"Integrated autocorrelation time $\tau_{\rm int}$ (ULMC steps)"
         )
         ax.set_title(
-            "First covariance-row IATs after "
+            "Two-point-correlator IATs after "
             "translation-invariant Gaussian cooling\n"
-            rf"$g_x(t)=\delta\phi_t(0)\delta\phi_t(x)$, "
-            rf"$\delta\phi=\phi-\bar{{\phi}}$, "
-            rf"$d={result.diagnostic_side}$, "
-            rf"$T={args.trajectory_samples}$, "
-            rf"$N_{{\rm burn}}={args.trajectory_burnin}$"
+            rf"$d={result.diagnostic_side},\ "
+            rf"T={args.trajectory_samples},\ "
+            rf"N_{{\rm burn}}={args.trajectory_burnin}$"
             + "\n"
             + _phi4_parameter_subtitle(args)
         )
         ax.grid(which="major", color="#D8D8D8", linewidth=0.55, alpha=0.8)
         ax.legend(
-            frameon=True,
-            facecolor="white",
-            framealpha=0.86,
-            edgecolor="none",
-            loc="upper left",
-            fontsize=7.6,
-        )
-        ax.text(
-            0.98,
-            0.03,
-            f"{np.count_nonzero(reliable):,}/{len(reliable):,} "
-            "entries reliable",
-            transform=ax.transAxes,
-            ha="right",
-            va="bottom",
-            color=GRAY,
+            frameon=False,
+            loc="upper center",
+            bbox_to_anchor=(0.5, -0.2),
+            ncols=3,
             fontsize=7.6,
         )
         figures[
@@ -2823,71 +3091,18 @@ def make_figures(
             extend="both",
         )
         colorbar.set_label(
-            r"Standardized mean "
-            r"$z_x=\bar{\phi}_x/\operatorname{MCSE}(\bar{\phi}_x)$"
+            r"Final-half site-mean $z_x$"
         )
         ax.set_xlabel("Lattice coordinate $x_2$")
         ax.set_ylabel("Lattice coordinate $x_1$")
         ax.set_title(
-            "Ergodicity diagnostic: final-half site-mean z-scores\n"
+            "Final-half site-mean z-scores\n"
             rf"$d={result.diagnostic_side}$, "
             rf"$T_{{\rm retained}}={args.trajectory_samples}$, "
             rf"$N_{{\rm half}}={result.final_half_sample_count}$, "
             rf"$N_{{\rm burn}}={args.trajectory_burnin}$"
             + "\n"
             + _phi4_parameter_subtitle(args)
-        )
-        reliable_count = int(np.count_nonzero(site_reliable))
-        if reliable_count:
-            reliable_effective_sizes = (
-                result.site_mean_effective_sample_sizes[site_reliable]
-            )
-            reliable_iats = result.site_field_autocorrelation_times[
-                site_reliable
-            ]
-            reliable_standard_errors = result.site_mean_standard_errors[
-                site_reliable
-            ]
-            within_two_standard_errors = np.mean(
-                np.abs(result.site_mean_z_scores[site_reliable]) <= 1.96
-            )
-            diagnostic_text = (
-                rf"reliable ($N_{{\rm half}}\geq "
-                rf"{result.iat_tolerance}\tau_x$): "
-                f"{reliable_count:,}/"
-                f"{site_reliable.size:,}\n"
-                rf"median $\tau_x$: {np.median(reliable_iats):.1f}; "
-                f"ESS: {np.median(reliable_effective_sizes):.1f}; "
-                f"MCSE: {np.median(reliable_standard_errors):.3g}\n"
-                rf"$|z_x|\leq1.96$: "
-                f"{100.0 * within_two_standard_errors:.1f}%\n"
-                rf"RMS$(\bar{{\phi}}_x)$: "
-                f"{np.sqrt(np.mean(result.final_half_site_means**2)):.3g}"
-            )
-        else:
-            diagnostic_text = (
-                rf"reliable ($N_{{\rm half}}\geq "
-                rf"{result.iat_tolerance}\tau_x$): "
-                f"0/{site_reliable.size:,}\n"
-                "chain too short for standardized inference\n"
-                rf"RMS$(\bar{{\phi}}_x)$: "
-                f"{np.sqrt(np.mean(result.final_half_site_means**2)):.3g}"
-            )
-        ax.text(
-            0.02,
-            0.02,
-            diagnostic_text,
-            transform=ax.transAxes,
-            ha="left",
-            va="bottom",
-            color="#222222",
-            fontsize=7.8,
-            bbox={
-                "facecolor": "white",
-                "edgecolor": "none",
-                "alpha": 0.78,
-                "pad": 2.0,
-            },
         )
         figures[
             f"ergodicity_site_mean_z_scores_d{result.diagnostic_side}"
@@ -2922,12 +3137,7 @@ def _parameter_sweep_subtitle(
     return (
         rf"$d={result.sweep_side},\ \beta={args.beta:g},\ "
         + fixed_parameters
-        + "$"
-        + "\n"
-        + rf"$n={args.chains},\ N={args.steps},\ K={result.stages},\ "
-        + rf"h={args.step_size:g},\ "
-        + rf"\gamma_{{\rm cool}}={args.cooling_gamma:g},\ "
-        + rf"n_{{\rm ref}}={result.reference_chains}$"
+        + rf";\ n={args.chains},\ N={args.steps},\ K={result.stages}$"
     )
 
 
@@ -2999,24 +3209,6 @@ def make_parameter_sweep_figures(
             + "\n"
             + _parameter_sweep_subtitle(sweep_name, result, args)
         )
-        if is_radius_sweep:
-            continuation_values = ", ".join(
-                (
-                    r"$\infty$: n/a"
-                    if np.isposinf(value)
-                    else f"{value:g}: {100.0 * fraction:.2g}%"
-                )
-                for value, fraction in zip(
-                    values,
-                    result.continuation_fractions[sweep_name],
-                    strict=True,
-                )
-            )
-            title_text += (
-                "\n"
-                + r"Reference $\Pr(|\phi|>R)$ by $R$: "
-                + continuation_values
-            )
         ax.set_title(title_text)
         ax.grid(
             which="major",
@@ -3025,10 +3217,7 @@ def make_parameter_sweep_figures(
             alpha=0.8,
         )
         ax.legend(
-            frameon=True,
-            facecolor="white",
-            framealpha=0.88,
-            edgecolor="none",
+            frameon=False,
             loc="upper center",
             bbox_to_anchor=(0.5, -0.24),
             ncols=2,
@@ -3076,6 +3265,254 @@ def make_parameter_sweep_figures(
         )
         figures["truncation_to_quartic_covariance"] = figure
     return figures
+
+
+def _logarithmic_cell_edges(values: np.ndarray) -> np.ndarray:
+    """Return geometric cell edges centered on positive axis values."""
+
+    values = np.asarray(values, dtype=float)
+    logarithms = np.log(values)
+    if len(values) == 1:
+        half_width = 0.5 * np.log(2.0)
+        return np.exp(
+            [logarithms[0] - half_width, logarithms[0] + half_width]
+        )
+    midpoints = 0.5 * (logarithms[:-1] + logarithms[1:])
+    edges = np.empty(len(values) + 1, dtype=float)
+    edges[1:-1] = midpoints
+    edges[0] = logarithms[0] - (midpoints[0] - logarithms[0])
+    edges[-1] = logarithms[-1] + (
+        logarithms[-1] - midpoints[-1]
+    )
+    return np.exp(edges)
+
+
+def _configure_hardness_axes(
+    ax: plt.Axes,
+    masses: np.ndarray,
+    quartics: np.ndarray,
+) -> None:
+    """Label the two physical hardness-map axes without ambiguity."""
+
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xticks(masses, [f"{value:g}" for value in masses])
+    ax.set_yticks(quartics, [f"{value:g}" for value in quartics])
+    ax.xaxis.set_minor_formatter(NullFormatter())
+    ax.yaxis.set_minor_formatter(NullFormatter())
+    ax.set_xlabel(r"Mass $m$")
+    ax.set_ylabel(r"Quartic coupling $\lambda$")
+
+
+def make_hardness_map_figures(
+    result: HardnessMapResult,
+    args: argparse.Namespace,
+) -> dict[str, plt.Figure]:
+    """Create absolute-quality and adaptive-gain maps for every side."""
+
+    _configure_plot_style()
+    medians = {
+        method: np.median(values, axis=-1)
+        for method, values in result.relative_conditions.items()
+    }
+    absolute_log_values = np.concatenate(
+        [
+            np.log10(values).reshape((-1,))
+            for values in medians.values()
+        ]
+    )
+    absolute_min = float(np.min(absolute_log_values))
+    absolute_max = float(np.max(absolute_log_values))
+    if np.isclose(absolute_min, absolute_max):
+        absolute_min -= 0.5
+        absolute_max += 0.5
+
+    baseline = medians[TRANSLATION_AVERAGED_ULMC]
+    gain_methods = (COOLING_COMPARISON, EMPIRICAL_COMPARISON)
+    gains = {
+        method: np.log10(baseline / medians[method])
+        for method in gain_methods
+    }
+    gain_limit = max(
+        float(np.max(np.abs(values)))
+        for values in gains.values()
+    )
+    gain_limit = max(gain_limit, 1e-6)
+
+    mass_edges = _logarithmic_cell_edges(result.masses)
+    quartic_edges = _logarithmic_cell_edges(result.quartics)
+    figures: dict[str, plt.Figure] = {}
+    short_titles = {
+        COOLING_COMPARISON: (
+            "Translation-invariant\nGaussian cooling"
+        ),
+        EMPIRICAL_COMPARISON: (
+            "Translation-invariant\nempirical preconditioning"
+        ),
+        TRANSLATION_AVERAGED_ULMC: (
+            "Translation-averaged\nULMC covariance"
+        ),
+    }
+    for side_index, side_value in enumerate(result.sides):
+        side = int(side_value)
+        dimension = side * side
+        budget_text = (
+            rf"$R={HARDNESS_RADIUS:g},\ \beta={HARDNESS_BETA:g},\ "
+            rf"d={side},\ D=d^2={dimension},\ "
+            rf"n={result.chains},\ N={result.steps},\ "
+            rf"K={result.stages}$"
+        )
+
+        absolute_figure, axes = plt.subplots(
+            1,
+            len(SCALABLE_METHODS),
+            figsize=(12.2, 4.6),
+            sharex=True,
+            sharey=True,
+            constrained_layout=True,
+        )
+        absolute_image = None
+        for ax, method in zip(axes, SCALABLE_METHODS, strict=True):
+            absolute_image = ax.pcolormesh(
+                mass_edges,
+                quartic_edges,
+                np.log10(medians[method][side_index]),
+                cmap="viridis",
+                vmin=absolute_min,
+                vmax=absolute_max,
+                shading="flat",
+            )
+            _configure_hardness_axes(
+                ax,
+                result.masses,
+                result.quartics,
+            )
+            ax.set_title(short_titles[method])
+        for ax in axes[1:]:
+            ax.set_ylabel("")
+        assert absolute_image is not None
+        absolute_colorbar = absolute_figure.colorbar(
+            absolute_image,
+            ax=axes,
+            shrink=0.88,
+            pad=0.02,
+        )
+        absolute_colorbar.set_label(
+            r"$\log_{10}(\widetilde{\kappa}_{\mathrm{rel}})$"
+        )
+        absolute_figure.suptitle(
+            r"Lattice $\phi^4$ preconditioner quality" + "\n" + budget_text,
+            fontsize=10.6,
+        )
+        figures[f"hardness_absolute_d{side}"] = absolute_figure
+
+        gain_figure, axes = plt.subplots(
+            1,
+            len(gain_methods),
+            figsize=(8.5, 4.6),
+            sharex=True,
+            sharey=True,
+            constrained_layout=True,
+        )
+        gain_image = None
+        for ax, method in zip(axes, gain_methods, strict=True):
+            gain_image = ax.pcolormesh(
+                mass_edges,
+                quartic_edges,
+                gains[method][side_index],
+                cmap="RdBu_r",
+                vmin=-gain_limit,
+                vmax=gain_limit,
+                shading="flat",
+            )
+            _configure_hardness_axes(
+                ax,
+                result.masses,
+                result.quartics,
+            )
+            ax.set_title(short_titles[method])
+        for ax in axes[1:]:
+            ax.set_ylabel("")
+        assert gain_image is not None
+        gain_colorbar = gain_figure.colorbar(
+            gain_image,
+            ax=axes,
+            shrink=0.88,
+            pad=0.02,
+        )
+        gain_colorbar.set_label(
+            r"$\log_{10}(\widetilde{\kappa}_{\rm rel,\,baseline}/"
+            r"\widetilde{\kappa}_{\rm rel,\,method})$"
+        )
+        gain_figure.suptitle(
+            "Relative performance against translation-averaged ULMC\n"
+            + budget_text,
+            fontsize=10.6,
+        )
+        figures[f"hardness_adaptive_gain_d{side}"] = gain_figure
+
+    return figures
+
+
+def save_hardness_map_data(
+    result: HardnessMapResult,
+    output: Path,
+    args: argparse.Namespace,
+) -> Path:
+    """Save numerical map values and fixed budgets beside the PDFs."""
+
+    output = output.expanduser().resolve()
+    stem = output.with_suffix("") if output.suffix else output
+    stem.parent.mkdir(parents=True, exist_ok=True)
+    path = stem.with_name(f"{stem.name}_hardness_map_data.npz")
+    np.savez_compressed(
+        path,
+        sides=result.sides,
+        dimensions=result.sides**2,
+        masses=result.masses,
+        quartics=result.quartics,
+        beta=np.asarray(HARDNESS_BETA),
+        radius=np.asarray(HARDNESS_RADIUS),
+        seed=np.asarray(args.seed),
+        dtype=np.asarray(args.dtype),
+        repeats=np.asarray(result.repeats),
+        cooling_gamma=np.asarray(args.cooling_gamma),
+        delta=np.asarray(args.delta),
+        friction=np.asarray(args.friction),
+        step_size=np.asarray(args.step_size),
+        covariance_ridge=np.asarray(args.covariance_ridge),
+        metric_floor=np.asarray(args.metric_floor),
+        budget_mode=np.asarray("fixed"),
+        reference_chain_factor=np.asarray(
+            args.hardness_reference_chain_factor
+        ),
+        reference_minimum_chains=np.asarray(
+            args.hardness_reference_min_chains
+        ),
+        reference_max_step=np.asarray(
+            args.hardness_reference_max_step
+        ),
+        reference_margin=np.asarray(args.hardness_reference_margin),
+        reference_time=np.asarray(args.hardness_reference_time),
+        reference_consistency_threshold=np.asarray(
+            args.hardness_reference_consistency_threshold
+        ),
+        cooling=result.relative_conditions[COOLING_COMPARISON],
+        empirical=result.relative_conditions[EMPIRICAL_COMPARISON],
+        translation_averaged=result.relative_conditions[
+            TRANSLATION_AVERAGED_ULMC
+        ],
+        hessian_condition_bounds=result.hessian_condition_bounds,
+        chains=result.chains,
+        steps=result.steps,
+        stages=np.asarray(result.stages),
+        reference_conditions=result.reference_conditions,
+        reference_split_conditions=result.reference_split_conditions,
+        reference_chains=result.reference_chains,
+        reference_step_sizes=result.reference_step_sizes,
+        reference_steps=result.reference_steps,
+    )
+    return path
 
 
 def save_publication_figures(
@@ -3447,10 +3884,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=_parse_sides,
         default=[10, 100],
         help=(
-            "Comma-separated lattice sides for the four-method stage "
+            "Comma-separated lattice sides for the stagewise "
             "comparison: translation-invariant cooling, translation-"
             "invariant empirical preconditioning, translation averaging "
-            "of plain ULMC, and the raw plain-ULMC covariance."
+            "of plain ULMC, and, where rank and size permit, the raw "
+            "plain-ULMC covariance."
         ),
     )
     parser.add_argument(
@@ -3510,6 +3948,111 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_false",
         help="Run parameter sweeps even when a preset would skip them.",
     )
+    hardness_group = parser.add_argument_group(
+        "separate fixed-R, fixed-beta hardness map"
+    )
+    hardness_group.add_argument(
+        "--hardness-map",
+        "--hardness-map-only",
+        action="store_true",
+        help=(
+            "Run only the scalable (mass, lambda) hardness maps with R=4 "
+            "and beta=2; the ordinary lattice experiment is not run."
+        ),
+    )
+    hardness_group.add_argument(
+        "--hardness-sides",
+        "--hardness-map-sides",
+        dest="hardness_sides",
+        type=_parse_sides,
+        default=[8, 16, 32, 64, 128],
+        help="Comma-separated lattice side lengths for the hardness map.",
+    )
+    hardness_group.add_argument(
+        "--hardness-masses",
+        "--hardness-map-masses",
+        dest="hardness_masses",
+        type=_parse_positive_values,
+        default=[0.01, 0.05, 0.25],
+        help="Horizontal-axis mass values for the hardness map.",
+    )
+    hardness_group.add_argument(
+        "--hardness-lambdas",
+        "--hardness-map-lambdas",
+        dest="hardness_quartics",
+        type=_parse_positive_values,
+        default=[0.1, 0.5, 2.0],
+        help="Vertical-axis quartic couplings for the hardness map.",
+    )
+    hardness_group.add_argument(
+        "--hardness-stages",
+        type=int,
+        default=12,
+        help="Fixed equal stage count K at every hardness-map cell.",
+    )
+    hardness_group.add_argument(
+        "--hardness-repeats",
+        type=int,
+        default=1,
+        help="Independent repeats at every hardness-map cell.",
+    )
+    hardness_group.add_argument(
+        "--hardness-chains",
+        type=int,
+        default=512,
+        help=(
+            "Fixed chain count n used by every method at every "
+            "hardness-map cell."
+        ),
+    )
+    hardness_group.add_argument(
+        "--hardness-steps",
+        type=int,
+        default=128,
+        help=(
+            "Fixed per-stage transition count N used by every method at "
+            "every hardness-map cell."
+        ),
+    )
+    hardness_group.add_argument(
+        "--hardness-reference-chain-factor",
+        type=float,
+        default=2.0,
+        help="Reference chains as a multiple of the method chain count.",
+    )
+    hardness_group.add_argument(
+        "--hardness-reference-min-chains",
+        type=int,
+        default=512,
+        help="Minimum independent reference endpoint count at each cell.",
+    )
+    hardness_group.add_argument(
+        "--hardness-reference-max-step",
+        type=float,
+        default=0.03,
+        help="Maximum step size for the independently tuned reference run.",
+    )
+    hardness_group.add_argument(
+        "--hardness-reference-margin",
+        type=float,
+        default=0.15,
+        help="Maximum h_ref*sqrt(L_ref) for a hardness-map reference.",
+    )
+    hardness_group.add_argument(
+        "--hardness-reference-time",
+        type=float,
+        default=2.0,
+        help="Physical integration time retained by each reference run.",
+    )
+    hardness_group.add_argument(
+        "--hardness-reference-consistency-threshold",
+        type=float,
+        default=1.5,
+        help=(
+            "Warn when kappa_rel between the two reference half-samples "
+            "exceeds this value."
+        ),
+    )
     parser.set_defaults(
         skip_diagnostics=False,
         skip_comparisons=False,
@@ -3532,9 +4075,10 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Require a JAX GPU backend and run the scalable lattice-size "
             "feasibility test at sides 64,128,256,512,1024 using conservative "
-            "float32 budgets. Dense paths, diagnostics, stage comparisons, "
-            "and parameter sweeps are skipped unless explicitly enabled; "
-            "explicit numerical options override the preset."
+            "float32 budgets, including stagewise convergence at sides 512 "
+            "and 1024. Dense paths, diagnostics, and parameter sweeps are "
+            "skipped unless explicitly enabled; explicit numerical options "
+            "override the preset."
         ),
     )
     parser.add_argument(
@@ -3617,6 +4161,37 @@ def apply_quick_configuration(
         )
 
 
+def apply_hardness_quick_configuration(
+    args: argparse.Namespace,
+    explicit_destinations: set[str] | None = None,
+) -> None:
+    """Shrink only the hardness-map grid and budgets for a smoke test."""
+
+    if not args.quick or not args.hardness_map:
+        return
+    explicitly_set = (
+        set()
+        if explicit_destinations is None
+        else explicit_destinations
+    )
+    quick_values = {
+        "hardness_sides": [4, 8],
+        "hardness_masses": [0.05, 0.25],
+        "hardness_quartics": [0.1, 0.5],
+        "hardness_stages": 2,
+        "hardness_repeats": 1,
+        "hardness_chains": 8,
+        "hardness_steps": 2,
+        "hardness_reference_chain_factor": 1.0,
+        "hardness_reference_min_chains": 16,
+        "hardness_reference_margin": 0.2,
+        "hardness_reference_time": 0.06,
+    }
+    for destination, value in quick_values.items():
+        if destination not in explicitly_set:
+            setattr(args, destination, value)
+
+
 def apply_gpu_configuration(
     args: argparse.Namespace,
     explicit_destinations: set[str] | None = None,
@@ -3642,7 +4217,7 @@ def apply_gpu_configuration(
         "parameter_sweep_side": 4,
         "parameter_sweep_reference_chains": 128,
         "skip_diagnostics": True,
-        "skip_comparisons": True,
+        "skip_comparisons": False,
         "skip_parameter_sweeps": True,
         "dtype": "float32",
     }
@@ -3670,8 +4245,15 @@ def apply_gpu_configuration(
             args.skip_diagnostics = True
 
     if "comparison_sides" not in explicitly_set:
-        args.comparison_sides = sorted(
-            {args.sides[0], args.sides[-1]}
+        gpu_stage_sides = [
+            side
+            for side in GPU_STAGE_COMPARISON_SIDES
+            if side in args.sides
+        ]
+        args.comparison_sides = (
+            gpu_stage_sides
+            if gpu_stage_sides
+            else sorted({args.sides[0], args.sides[-1]})
         )
 
 
@@ -3691,6 +4273,128 @@ def _available_gpu_devices() -> list[object]:
         for device in devices
         if str(device.platform).lower() in gpu_platforms
     ]
+
+
+def validate_hardness_arguments(args: argparse.Namespace) -> None:
+    """Validate only options used by the separate hardness-map mode."""
+
+    if args.gpu and not _available_gpu_devices():
+        raise RuntimeError(
+            "--gpu requires a JAX GPU backend, but no GPU device was found. "
+            "The hardness map otherwise uses whichever JAX backend is "
+            "available automatically."
+        )
+    if args.gpu and args.dtype == "float64":
+        warnings.warn(
+            "Float64 approximately doubles hardness-map state storage. Run "
+            "the float32 map first to establish the memory margin.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    positive_counts = {
+        "hardness-stages": args.hardness_stages,
+        "hardness-repeats": args.hardness_repeats,
+        "hardness-chains": args.hardness_chains,
+        "hardness-steps": args.hardness_steps,
+        "hardness-reference-min-chains": (
+            args.hardness_reference_min_chains
+        ),
+    }
+    invalid_counts = [
+        name for name, value in positive_counts.items() if value <= 0
+    ]
+    if invalid_counts:
+        raise ValueError(
+            "These hardness-map counts must be positive: "
+            + ", ".join(invalid_counts)
+            + "."
+        )
+    if args.hardness_chains < 2:
+        raise ValueError("--hardness-chains must be at least two.")
+    if args.hardness_reference_min_chains < 4:
+        raise ValueError(
+            "--hardness-reference-min-chains must be at least four."
+        )
+    positive_scalars = {
+        "hardness-reference-chain-factor": (
+            args.hardness_reference_chain_factor
+        ),
+        "hardness-reference-max-step": (
+            args.hardness_reference_max_step
+        ),
+        "hardness-reference-margin": args.hardness_reference_margin,
+        "hardness-reference-time": args.hardness_reference_time,
+        "hardness-reference-consistency-threshold": (
+            args.hardness_reference_consistency_threshold
+        ),
+        "cooling-gamma": args.cooling_gamma,
+        "delta": args.delta,
+        "friction": args.friction,
+        "step-size": args.step_size,
+        "metric-floor": args.metric_floor,
+    }
+    invalid_scalars = [
+        name
+        for name, value in positive_scalars.items()
+        if not np.isfinite(value) or value <= 0.0
+    ]
+    if invalid_scalars:
+        raise ValueError(
+            "These hardness-map values must be finite and positive: "
+            + ", ".join(invalid_scalars)
+            + "."
+        )
+    if args.cooling_gamma >= 1.0:
+        raise ValueError("--cooling-gamma must lie in (0, 1).")
+    if (
+        not np.isfinite(args.covariance_ridge)
+        or args.covariance_ridge < 0.0
+    ):
+        raise ValueError(
+            "--covariance-ridge must be finite and nonnegative."
+        )
+
+    map_models = [
+        make_lattice_model(
+            side,
+            HARDNESS_BETA,
+            quartic,
+            mass,
+            HARDNESS_RADIUS,
+            jnp.float32,
+        )
+        for side in args.hardness_sides
+        for quartic in args.hardness_quartics
+        for mass in args.hardness_masses
+    ]
+    maximum_smoothness = max(
+        model.design_smoothness for model in map_models
+    )
+    stiffness_margin = args.step_size * np.sqrt(maximum_smoothness)
+    if stiffness_margin > 0.5:
+        warnings.warn(
+            "The hardest map cell has "
+            f"h*sqrt(L)={stiffness_margin:.3g}; reduce --step-size if "
+            "method trajectories become unstable.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    maximum_condition = max(
+        model.global_smoothness_bound / model.strong_convexity
+        for model in map_models
+    )
+    final_cooling_residual = (
+        args.cooling_gamma**args.hardness_stages * maximum_condition
+    )
+    if not args.quick and final_cooling_residual > args.delta:
+        warnings.warn(
+            "The hardest map cell has "
+            f"gamma_cool^K*kappa_H={final_cooling_residual:.3g}, above "
+            f"delta={args.delta:g}. Increase --hardness-stages so the map "
+            "does not mistake unfinished cooling for estimator failure.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
 
 
 def validate_arguments(args: argparse.Namespace) -> None:
@@ -4001,7 +4705,7 @@ def print_summary(result: LatticeResult) -> None:
             f"{dense_text:>17}"
         )
 
-    print("\nMedian cached wall times (seconds)")
+    print("\nMedian wall times after JIT compilation (seconds)")
     print(
         "side".ljust(7)
         + "TI cooling".rjust(15)
@@ -4227,6 +4931,70 @@ def print_parameter_sweep_summary(
     )
 
 
+def print_hardness_map_summary(result: HardnessMapResult) -> None:
+    """Report axes, budgets, and cell winners for the hardness-map test."""
+
+    print(
+        "\nHardness-map axes: horizontal mass m="
+        + ",".join(f"{value:g}" for value in result.masses)
+        + "; vertical quartic coupling lambda="
+        + ",".join(f"{value:g}" for value in result.quartics)
+    )
+    print(
+        f"Fixed beta={HARDNESS_BETA:g}, R={HARDNESS_RADIUS:g}. "
+        f"Every cell uses fixed n={result.chains}, N={result.steps}, "
+        f"K={result.stages}. "
+        "Ambient dimension is D=d^2."
+    )
+    median_conditions = {
+        method: np.median(values, axis=-1)
+        for method, values in result.relative_conditions.items()
+    }
+    stacked = np.stack(
+        [median_conditions[method] for method in SCALABLE_METHODS],
+        axis=0,
+    )
+    winners = np.argmin(stacked, axis=0)
+    for side_index, side_value in enumerate(result.sides):
+        side = int(side_value)
+        reference_chain_grid = result.reference_chains[side_index]
+        reference_step_grid = result.reference_steps[side_index]
+        reference_step_size_grid = result.reference_step_sizes[side_index]
+        reference_split_grid = result.reference_split_conditions[
+            side_index
+        ]
+        winner_counts = {
+            short_name: int(np.count_nonzero(winners[side_index] == index))
+            for index, short_name in enumerate(
+                ("cooling", "TI empirical", "TI-averaged ULMC")
+            )
+        }
+        print(
+            f"  side={side} (D={side * side}): "
+            f"N={result.steps}, n={result.chains}, "
+            + ", ".join(
+                f"{name} wins {count} cell(s)"
+                for name, count in winner_counts.items()
+            )
+        )
+        print(
+            "    reference ranges: "
+            f"n_ref={np.min(reference_chain_grid)}--"
+            f"{np.max(reference_chain_grid)}, "
+            f"N_ref={np.min(reference_step_grid)}--"
+            f"{np.max(reference_step_grid)}, "
+            f"h_ref={np.min(reference_step_size_grid):.3g}--"
+            f"{np.max(reference_step_size_grid):.3g}, "
+            f"half-sample kappa_rel="
+            f"{np.min(reference_split_grid):.3g}--"
+            f"{np.max(reference_split_grid):.3g}"
+        )
+    print(
+        "Hardness-map wall time (including compilation): "
+        f"{result.elapsed_seconds:.2f}s"
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     arguments = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
@@ -4234,6 +5002,82 @@ def main(argv: Sequence[str] | None = None) -> None:
     if args.quick and args.gpu:
         parser.error("--quick and --gpu are mutually exclusive presets.")
     explicit_destinations = _explicit_cli_destinations(parser, arguments)
+    if args.hardness_map:
+        ignored_hardness_options = {
+            "sides": "--hardness-sides",
+            "quartic": "--hardness-lambdas",
+            "mass": "--hardness-masses",
+            "chains": "--hardness-chains",
+            "steps": "--hardness-steps",
+            "stages": "--hardness-stages",
+            "repeats": "--hardness-repeats",
+            "reference_chains": "--hardness-reference-min-chains",
+            "reference_steps": "--hardness-reference-time",
+            "reference_step_size": "--hardness-reference-max-step",
+        }
+        conflicting = sorted(
+            set(ignored_hardness_options) & explicit_destinations
+        )
+        if conflicting:
+            details = ", ".join(
+                f"--{name.replace('_', '-')} -> "
+                f"{ignored_hardness_options[name]}"
+                for name in conflicting
+            )
+            parser.error(
+                "--hardness-map uses separate grid/budget options; replace "
+                + details
+                + "."
+            )
+        fixed_target_options = {"beta", "radius"}
+        if fixed_target_options & explicit_destinations:
+            parser.error(
+                "--hardness-map fixes --beta=2 and --radius=4; do not pass "
+                "either ordinary target option."
+            )
+        apply_hardness_quick_configuration(
+            args,
+            explicit_destinations,
+        )
+        validate_hardness_arguments(args)
+        backend_text = jax.default_backend()
+        if args.gpu:
+            backend_text = ", ".join(
+                str(getattr(device, "device_kind", device))
+                for device in _available_gpu_devices()
+            )
+        print(
+            "Separate hardness map: horizontal axis=m, vertical axis=lambda; "
+            f"beta={HARDNESS_BETA:g}, R={HARDNESS_RADIUS:g}; "
+            f"sides={','.join(map(str, args.hardness_sides))}; "
+            "D=side^2; "
+            f"fixed n={args.hardness_chains}, "
+            f"N={args.hardness_steps}, K={args.hardness_stages}; "
+            f"backend={backend_text}",
+            flush=True,
+        )
+        hardness_result = run_hardness_map(args)
+        hardness_figures = make_hardness_map_figures(
+            hardness_result,
+            args,
+        )
+        output_paths = save_publication_figures(
+            hardness_figures,
+            args.output,
+        )
+        data_path = save_hardness_map_data(
+            hardness_result,
+            args.output,
+            args,
+        )
+        for figure in hardness_figures.values():
+            plt.close(figure)
+        print_hardness_map_summary(hardness_result)
+        for plot_name, path in output_paths.items():
+            print(f"Saved {plot_name.replace('_', ' ')} PDF: {path}")
+        print(f"Saved hardness-map numerical data: {data_path}")
+        return
+
     apply_quick_configuration(
         args,
         explicit_destinations,
@@ -4252,11 +5096,16 @@ def main(argv: Sequence[str] | None = None) -> None:
             if args.skip_diagnostics
             else f"d={args.diagnostic_side}"
         )
+        comparison_text = (
+            "disabled"
+            if args.skip_comparisons
+            else ",".join(map(str, args.comparison_sides))
+        )
         print(
             "GPU large-lattice preset: "
             f"devices={device_names}; sides={','.join(map(str, args.sides))}; "
             f"n={args.chains}; N={args.steps}; K={args.stages}; "
-            f"diagnostics={diagnostic_text}",
+            f"stage sides={comparison_text}; diagnostics={diagnostic_text}",
             flush=True,
         )
 
