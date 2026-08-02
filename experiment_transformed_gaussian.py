@@ -766,7 +766,7 @@ def make_figures(
     ax.set_xlabel(r"Transformation condition number $\kappa(B)$")
     ax.set_ylabel(r"Relative condition number $\kappa_{\mathrm{rel}}$")
     ax.set_title(
-        r"$\kappa_{\mathrm{rel}}$ vs. \kappa(B)\n"
+        r"$\kappa_{\mathrm{rel}}$ vs. $\kappa(B)$" + "\n"
         rf"$\kappa(\Sigma_0)={result.base_condition_number:g}$, "
         rf"$d={dimension}$, $n={num_chains}$, $N={num_steps}$, "
         rf"$K={num_stages}$"
@@ -817,7 +817,7 @@ def make_figures(
     ax.set_xlabel(r"Stage $k$")
     ax.set_ylabel(r"Relative condition number $\kappa_{\mathrm{rel}}$")
     ax.set_title(
-        r"Convergence of $\kappa_{\mathrm{rel}}$ across stages\n"
+        r"Convergence of $\kappa_{\mathrm{rel}}$ across stages" + "\n"
         rf"$\kappa(\Sigma_0)={result.base_condition_number:g}$, "
         rf"$\kappa(B)={result.kappas[-1]:g}$, " + "\n"
         rf"$d={dimension}$, $n={num_chains}$, $N={num_steps}$, "
