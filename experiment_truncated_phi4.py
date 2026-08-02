@@ -2767,7 +2767,7 @@ def make_figures(
     ax.set_xlabel(r"Lattice side length $d$")
     ax.set_ylabel(r"Relative condition number $\kappa_{\mathrm{rel}}$")
     ax.set_title(
-        "Preconditioner quality for the lattice $\\phi^4$ target\n"
+        r"$\kappa_{\mathrm{rel}}$ vs. $d$\n"
         + _phi4_parameter_subtitle(args)
     )
     ax.grid(which="major", color="#D8D8D8", linewidth=0.55, alpha=0.8)
@@ -2852,7 +2852,7 @@ def make_figures(
         ax.set_xlabel(r"Lattice side length $d$")
         ax.set_ylabel(r"Relative condition number $\kappa_{\mathrm{rel}}$")
         ax.set_title(
-            "Dense versus translation-invariant Gaussian cooling\n"
+            "Dense vs. translation-invariant Gaussian cooling\n"
             + _phi4_parameter_subtitle(args)
         )
         ax.grid(which="major", color="#D8D8D8", linewidth=0.55, alpha=0.8)
@@ -3254,7 +3254,7 @@ def make_parameter_sweep_figures(
             r"$\kappa_{\mathrm{rel}}(\Sigma_R,\Sigma_\infty)$"
         )
         ax.set_title(
-            "Reference-covariance convergence to the genuine quartic target\n"
+            "Reference convergence to quartic covariance\n"
             + _parameter_sweep_subtitle("radius", result, args)
         )
         ax.grid(
