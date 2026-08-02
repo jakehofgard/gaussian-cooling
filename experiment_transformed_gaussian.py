@@ -883,7 +883,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dimension",
         type=int,
-        default=1000,
+        default=100,
         help="Target dimension.",
     )
     parser.add_argument(
