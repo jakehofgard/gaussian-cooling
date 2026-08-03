@@ -29,7 +29,7 @@ RUN python -m pip install --no-cache-dir --upgrade pip wheel \
 
 COPY gaussian_cooling_algs.py ./
 COPY experiment_transformed_gaussian.py ./
-COPY experiment_truncated_phi4.py ./
+COPY phi4/*.py ./phi4/
 COPY README.md RUNPOD.md ./
 
 CMD ["bash"]

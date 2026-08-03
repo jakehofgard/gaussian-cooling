@@ -7,8 +7,8 @@ logs, and results. This avoids package installation after the Pod starts and
 allows it to be terminated as soon as the experiment finishes. Scheduling and
 a cold multi-GB image pull can still add startup time.
 
-The scripts currently use one JAX device. Requesting multiple H100s will not
-make them faster.
+The experiment modules currently use one JAX device. Requesting multiple H100s
+will not make them faster.
 
 ## 1. Create the network volume first
 
@@ -269,9 +269,8 @@ python -u experiment_transformed_gaussian.py \
   --output-prefix "${RUN_DIR}/gaussian_smoke" \
   2>&1 | tee "${RUN_DIR}/gaussian_smoke.log"
 
-python -u experiment_truncated_phi4.py \
+python -u -m phi4.experiment_phi4_scaling \
   --quick --repeats 1 --steps 8 --stages 2 --dense-max-side 0 \
-  --skip-diagnostics --skip-comparisons --skip-parameter-sweeps \
   --output-prefix "${RUN_DIR}/phi4_smoke" \
   2>&1 | tee "${RUN_DIR}/phi4_smoke.log"
 ```
@@ -320,32 +319,41 @@ convergence repeat, in addition to evaluation and compilation. Keep
 `--convergence-repeats 1` while scaling and increase it only for the final
 convergence figure.
 
-### Large translation-invariant lattice phi4 run
+### Large translation-invariant lattice phi4 runs
 
-The conservative one-command H100 run is:
+Run scaling and stage convergence independently so a failure in one does not
+discard the other experiment:
 
 ```bash
-python -u experiment_truncated_phi4.py --gpu \
-  --output-prefix "${RUN_DIR}/phi4_gpu_scale" \
-  2>&1 | tee "${RUN_DIR}/phi4_gpu_scale.log"
+python -u -m phi4.experiment_phi4_scaling --gpu \
+  --output-prefix "${RUN_DIR}/phi4_gpu_scaling" \
+  2>&1 | tee "${RUN_DIR}/phi4_gpu_scaling.log"
+
+python -u -m phi4.experiment_phi4_stage_convergence --gpu \
+  --output-prefix "${RUN_DIR}/phi4_gpu_stages" \
+  2>&1 | tee "${RUN_DIR}/phi4_gpu_stages.log"
 ```
 
-The flag verifies that JAX sees a GPU, then runs sides 64, 128, 256, 512, and
-1024 with 64 chains, 128 reference chains, 32 transitions per stage, eight
-stages, one repeat, and float32. It also writes stagewise-convergence plots for
-sides 512 and 1024. Those histories use only Fourier spectra and therefore
-remain linear in `D`, but they add separate runs for each of the three scalable
-methods. The full empirical covariance baseline is omitted because 64 samples
-give a rank-deficient covariance at these dimensions. The preset disables
-dense matrices, diagnostics, and parameter sweeps. Explicit flags override
-every preset value; add `--skip-comparisons` when only feasibility and timing
-matter, or use `--comparison-sides` to select different history sizes.
+The scaling preset verifies that JAX sees a GPU, then runs sides 64, 128, 256,
+512, and 1024 with 64 chains, 128 reference chains, 32 transitions per stage,
+eight stages, one repeat, and float32. The stage preset runs sides 512 and
+1024. Both retain only the three Fourier methods at these ranks. The full
+empirical covariance is rank deficient, and a dense covariance would be
+prohibitively large.
+
+The convenience suite launcher runs both presets in one command:
+
+```bash
+python -u -m phi4 --gpu \
+  --output-prefix "${RUN_DIR}/phi4_gpu_suite" \
+  2>&1 | tee "${RUN_DIR}/phi4_gpu_suite.log"
+```
 
 If the first run fits comfortably, increase precision deliberately, for
 example:
 
 ```bash
-python -u experiment_truncated_phi4.py --gpu \
+python -u -m phi4.experiment_phi4_scaling --gpu \
   --chains 128 --reference-chains 256 --repeats 3 \
   --output-prefix "${RUN_DIR}/phi4_gpu_scale_n128" \
   2>&1 | tee "${RUN_DIR}/phi4_gpu_scale_n128.log"
@@ -365,35 +373,41 @@ Run smaller, qualitatively different outputs separately when needed:
 
 ```bash
 # Stage comparisons; raw full covariance appears only where rank/size permit.
-python -u experiment_truncated_phi4.py \
-  --sides 10,100 --comparison-sides 10,100 \
-  --skip-diagnostics --skip-parameter-sweeps \
+python -u -m phi4.experiment_phi4_stage_convergence \
+  --sides 10,100 \
   --output-prefix "${RUN_DIR}/phi4_stage_comparison" \
   2>&1 | tee "${RUN_DIR}/phi4_stage_comparison.log"
 
 # Lambda, mass, and radius sweeps; the default sweep lattice is d=10.
-python -u experiment_truncated_phi4.py \
-  --sides 2 --repeats 3 --steps 64 --stages 2 \
-  --parameter-sweep-stages 12 \
-  --skip-diagnostics --skip-comparisons \
+python -u -m phi4.experiment_phi4_parameter_sweeps \
+  --repeats 3 --steps 64 --stages 12 \
   --output-prefix "${RUN_DIR}/phi4_parameter_sweeps" \
   2>&1 | tee "${RUN_DIR}/phi4_parameter_sweeps.log"
 
 # Post-cooling two-point-correlator IAT and ergodicity diagnostics.
 export TMPDIR="/tmp/gaussian-cooling-${RUN_ID}"
 mkdir -p "${TMPDIR}"
-python -u experiment_truncated_phi4.py \
-  --sides 100 --repeats 1 --dense-max-side 0 \
-  --skip-comparisons --skip-parameter-sweeps \
+python -u -m phi4.experiment_phi4_diagnostics \
   --output-prefix "${RUN_DIR}/phi4_diagnostics_d100" \
   2>&1 | tee "${RUN_DIR}/phi4_diagnostics_d100.log"
+
+# Four-method center-site correlator decay at d=10.
+python -u -m phi4.experiment_phi4_correlator \
+  --output-prefix "${RUN_DIR}/phi4_correlator_d10" \
+  2>&1 | tee "${RUN_DIR}/phi4_correlator_d10.log"
+
+# Fixed-budget R=4, beta=2 hardness map.
+python -u -m phi4.experiment_phi4_hardness_map --gpu \
+  --repeats 3 \
+  --output-prefix "${RUN_DIR}/phi4_hardness" \
+  2>&1 | tee "${RUN_DIR}/phi4_hardness.log"
 ```
 
-The parameter sweeps use small dense problems, and the diagnostics generate a
-single trajectory followed by CPU-side autocorrelation analysis. They can
-leave an H100 underutilized; after validating the environment, benchmark them
-on a less expensive GPU. Keep diagnostic memmaps in local `/tmp`, as above,
-and only persist the logs and PDFs. Their storage is approximately
+The parameter sweeps use small dense problems, and the diagnostics generate
+one or more trajectories followed by CPU-side autocorrelation analysis. They
+can leave an H100 underutilized; after validating the environment, benchmark
+them on a less expensive GPU. Keep diagnostic memmaps in local `/tmp`, as
+above, and only persist the logs and PDFs. Their storage is approximately
 `trajectory_samples * d^2 * bytes_per_value`: the defaults use about 313 MiB
 at `d=100` in float32, while `d=500` would use about 7.6 GiB. Ensure the Pod's
 local disk has room.
@@ -402,17 +416,17 @@ The parameter-sweep reference sampler automatically reduces its step size for
 stiff targets, which can substantially increase its transition count at small
 mass, large quartic coupling, or large radius. Benchmark the hardest requested
 sweep points before running all repeats. For a cheap exploratory sweep, reduce
-`--repeats` and `--steps`; retain `--parameter-sweep-stages 12` unless the
+`--repeats` and `--steps`; retain `--stages 12` unless the
 stage budget itself is deliberately under study.
 
 With the stage-comparison defaults, the raw full-covariance curve is available
 at `d=10` but omitted at `d=100`, where `chains <= D` and the dense cutoff is
-exceeded. The diagnostics command also reruns all main preconditioner methods
-and the reference estimate at `d=100` before generating its single diagnostic
-trajectory; include that duplicated work in the cost estimate.
+exceeded. The focused diagnostics and correlator modules learn only the
+preconditioners needed for their own trajectories, avoiding the unrelated
+scaling and sweep work formerly performed by the suite launcher.
 
 For exploratory phi4 scaling, float32 is substantially smaller and is the
-script default. Use float64 for final runs when sensitivity of the spectral
+module default. Use float64 for final runs when sensitivity of the spectral
 metrics warrants it. The transformed-Gaussian experiment defaults to float64.
 
 ## 7. Record provenance and terminate promptly
@@ -475,7 +489,7 @@ variables; do not copy the key into a log. See the
 Keep the independent `--terminate-after` deadline in case the runner or API
 request fails.
 
-On failure, preserve the log and write `_FAILED`. The experiment scripts save
+On failure, preserve the log and write `_FAILED`. The experiment modules save
 their PDFs only near the end, so splitting independent components as above
 reduces the amount of work lost to an interruption.
 
