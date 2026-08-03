@@ -89,13 +89,13 @@ def add_target_arguments(
     parser.add_argument(
         "--mass",
         type=float,
-        default=0.25,
+        default=0.01,
         help="Mass m.",
     )
     parser.add_argument(
         "--radius",
         type=float,
-        default=2.0,
+        default=4.0,
         help=(
             "Quadratic-continuation radius R; use 'inf' for the genuine "
             "quartic target."
@@ -130,13 +130,13 @@ def add_sampler_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--steps",
         type=int,
-        default=64,
+        default=128,
         help="ULMC transitions N per stage.",
     )
     parser.add_argument(
         "--stages",
         type=int,
-        default=8,
+        default=12,
         help="Stages K.",
     )
     parser.add_argument(
@@ -323,10 +323,10 @@ def apply_gpu_configuration(
     explicitly_set = set() if explicit_destinations is None else explicit_destinations
     gpu_values: dict[str, object] = {
         "repeats": 1,
-        "chains": 64,
-        "steps": 32,
-        "stages": 8,
-        "reference_chains": 128,
+        "chains": 512,
+        "steps": 128,
+        "stages": 12,
+        "reference_chains": 512,
         "reference_steps": 128,
         "dense_max_side": 0,
         "dtype": "float32",
