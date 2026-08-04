@@ -29,6 +29,7 @@ GPU_EXPERIMENTS = ("scaling", "stages")
 def _experiment_mains() -> dict[str, ExperimentMain]:
     """Import experiment entry points lazily after parsing the suite CLI."""
 
+    from .experiment_phi4_budget_scaling import main as budget_main
     from .experiment_phi4_correlator import main as correlator_main
     from .experiment_phi4_diagnostics import main as diagnostics_main
     from .experiment_phi4_hardness_map import main as hardness_main
@@ -39,6 +40,7 @@ def _experiment_mains() -> dict[str, ExperimentMain]:
     return {
         "scaling": scaling_main,
         "stages": stages_main,
+        "budget": budget_main,
         "diagnostics": diagnostics_main,
         "correlator": correlator_main,
         "sweeps": sweeps_main,
@@ -56,7 +58,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--only",
-        choices=(*ORDINARY_EXPERIMENTS, "hardness"),
+        choices=(*ORDINARY_EXPERIMENTS, "budget", "hardness"),
         action="append",
         help=(
             "Run only the selected workflow; repeat for several. By default "
@@ -78,8 +80,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--gpu",
         action="store_true",
         help=(
-            "Require a GPU and run only lattice scaling plus stage "
-            "convergence, matching the historical H100 suite."
+            "Require a GPU. Without --only, run lattice scaling plus stage "
+            "convergence, matching the historical H100 suite; budget "
+            "scaling is also available through --only budget."
         ),
     )
     parser.add_argument(
@@ -102,11 +105,12 @@ def _selected_experiments(args: argparse.Namespace) -> tuple[str, ...]:
         return ("hardness",)
     if args.only:
         selected = tuple(dict.fromkeys(args.only))
-        gpu_compatible = (*GPU_EXPERIMENTS, "hardness")
+        gpu_compatible = (*GPU_EXPERIMENTS, "budget", "hardness")
         if args.gpu and any(name not in gpu_compatible for name in selected):
             raise ValueError(
-                "The suite --gpu preset supports scaling, stages, and the "
-                "hardness-map GPU check; invoke other focused modules directly."
+                "The suite --gpu preset supports scaling, stages, budget "
+                "scaling, and the hardness-map GPU check; invoke other "
+                "focused modules directly."
             )
         return selected
     return GPU_EXPERIMENTS if args.gpu else ORDINARY_EXPERIMENTS

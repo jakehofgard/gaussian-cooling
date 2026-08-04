@@ -260,7 +260,7 @@ mkdir -p "${RUN_DIR}"
 cd "${GC_REPO}"
 ```
 
-Run both smoke tests:
+Run these smoke tests:
 
 ```bash
 python -u experiment_transformed_gaussian.py \
@@ -273,6 +273,10 @@ python -u -m phi4.experiment_phi4_scaling \
   --quick --repeats 1 --steps 8 --stages 2 --dense-max-side 0 \
   --output-prefix "${RUN_DIR}/phi4_smoke" \
   2>&1 | tee "${RUN_DIR}/phi4_smoke.log"
+
+python -u -m phi4.experiment_phi4_budget_scaling \
+  --quick --output-prefix "${RUN_DIR}/phi4_budget_smoke" \
+  2>&1 | tee "${RUN_DIR}/phi4_budget_smoke.log"
 ```
 
 A smoke test validates the installation but does not warm the production JAX
@@ -348,6 +352,34 @@ python -u -m phi4 --gpu \
   --output-prefix "${RUN_DIR}/phi4_gpu_suite" \
   2>&1 | tee "${RUN_DIR}/phi4_gpu_suite.log"
 ```
+
+The focused budget-scaling experiment fixes $d=100$ and runs
+`(n,N)=(64,32),(128,64),(256,128),(512,256),(1024,512)`. Both coordinates
+increase together, so the result measures improvement with joint budget and
+does not separate the effects of more chains from longer chains. First run one
+repeat to compile every production shape and check cost:
+
+```bash
+python -u -m phi4.experiment_phi4_budget_scaling --gpu \
+  --repeats 1 \
+  --output-prefix "${RUN_DIR}/phi4_budget_d100_benchmark" \
+  2>&1 | tee "${RUN_DIR}/phi4_budget_d100_benchmark.log"
+```
+
+If the reference consistency, runtime, and memory use are acceptable, run the
+five-repeat default for the publication figure:
+
+```bash
+python -u -m phi4.experiment_phi4_budget_scaling --gpu \
+  --output-prefix "${RUN_DIR}/phi4_budget_d100" \
+  2>&1 | tee "${RUN_DIR}/phi4_budget_d100.log"
+```
+
+The run writes one vector PDF ending in `_budget_scaling_d100.pdf` and one NPZ
+ending in `_budget_scaling_d100_data.npz`. The NPZ contains all learned
+spectra, repeat-level relative condition numbers, timings, budgets, and
+reference metadata. The default shared reference uses 4,096 chains and derives
+a stable step size from the transformed target curvature.
 
 If the first run fits comfortably, increase precision deliberately, for
 example:

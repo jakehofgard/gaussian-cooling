@@ -29,6 +29,7 @@ value is one. Every figure is saved as a separate vector PDF.
 | `phi4/experiment_phi4_correlator.py` | Center-site two-point correlators under each preconditioner. |
 | `phi4/experiment_phi4_parameter_sweeps.py` | Controlled $\lambda$, $m$, and $R$ sweeps. |
 | `phi4/experiment_phi4_hardness_map.py` | Fixed-budget $(m,\lambda)$ hardness maps. |
+| `phi4/experiment_phi4_budget_scaling.py` | Joint chain-and-step convergence of translation-invariant Gaussian cooling. |
 | `phi4/__main__.py` | Convenience launcher for the complete lattice $\phi^4$ suite. |
 | `RUNPOD.md` | Cost-conscious H100 setup and production commands. |
 | `Dockerfile.runpod` | Optional reproducible NVIDIA container. |
@@ -67,6 +68,9 @@ python -m phi4.experiment_phi4_scaling --quick \
 
 python -m phi4.experiment_phi4_hardness_map --quick \
   --output-prefix results/phi4_hardness_quick
+
+python -m phi4.experiment_phi4_budget_scaling --quick \
+  --output-prefix results/phi4_budget_quick
 ```
 
 ## Transformed Gaussian
@@ -143,6 +147,7 @@ Each experiment can be run independently with only its relevant options.
 | `phi4/experiment_phi4_correlator.py` | Center-site correlator decay under each feasible preconditioner | `_two_point_correlator_decay_d{d}.pdf` |
 | `phi4/experiment_phi4_parameter_sweeps.py` | One-factor $\lambda$, $m$, and $R$ comparisons | `_parameter_sweep_lambda.pdf`, `_parameter_sweep_mass.pdf`, `_parameter_sweep_radius.pdf`, `_truncation_to_quartic_covariance.pdf` |
 | `phi4/experiment_phi4_hardness_map.py` | Fixed-budget map over $(m,\lambda)$ at $R=4$, $\beta=2$ | `_hardness_absolute_d{d}.pdf`, `_hardness_adaptive_gain_d{d}.pdf`, `_hardness_map_data.npz` |
+| `phi4/experiment_phi4_budget_scaling.py` | Joint convergence as chains $n$ and steps $N$ increase at fixed $d=100$ | `_budget_scaling_d100.pdf`, `_budget_scaling_d100_data.npz` |
 
 Default runs:
 
@@ -164,6 +169,9 @@ python -m phi4.experiment_phi4_parameter_sweeps \
 
 python -m phi4.experiment_phi4_hardness_map \
   --output-prefix figures/phi4_hardness
+
+python -m phi4.experiment_phi4_budget_scaling --gpu \
+  --output-prefix figures/phi4_budget_scaling
 ```
 
 Use `python -m phi4.MODULE --help` for focused scientific controls. The suite
@@ -224,7 +232,27 @@ python -m phi4.experiment_phi4_scaling --quick --radius inf \
 
 Check important runs with a larger design radius and smaller step size.
 
-### Parameter sweeps and hardness map
+### Budget scaling, parameter sweeps, and hardness map
+
+The budget-scaling experiment fixes $d=100$, $\beta=2$, $\lambda=0.5$,
+$m=0.01$, $R=4$, and $K=12$. It evaluates translation-invariant Gaussian
+cooling along
+
+```math
+(n,N)\in\{(64,32),(128,64),(256,128),(512,256),(1024,512)\}.
+```
+
+The PDF shows the median relative condition number and interquartile range
+over five repeats, with chains $n$ on the lower axis and steps per chain and
+stage $N$ on the upper axis. One shared reference uses 4,096 independently
+preconditioned chains and an automatically stability-limited step size. The
+NPZ preserves every learned spectrum, relative condition, runtime, budget,
+and reference setting. Since $n$ and $N$ increase together, this tests
+convergence with joint computational budget; it does not identify their
+separate effects. Use `--budgets CHAINS:STEPS,...` to study another path.
+Because the default run is accelerator-scale, it is not part of the ordinary
+`python -m phi4` suite; invoke it directly or select it with
+`python -m phi4 --only budget`.
 
 The parameter-sweep defaults use side 10. They vary
 $\lambda\in\{0.1,0.5,2\}$ at $m=0.05,R=2$,
@@ -251,7 +279,8 @@ the reference budget for publication results.
 
 ### GPU scaling
 
-Run the two large-lattice experiments independently:
+Run the large-lattice scaling and stage experiments independently, and run the
+fixed-$d$ budget study as a separate job:
 
 ```bash
 python -m phi4.experiment_phi4_scaling --gpu \
@@ -259,6 +288,9 @@ python -m phi4.experiment_phi4_scaling --gpu \
 
 python -m phi4.experiment_phi4_stage_convergence --gpu \
   --output-prefix figures/phi4_gpu_stages
+
+python -m phi4.experiment_phi4_budget_scaling --gpu \
+  --output-prefix figures/phi4_budget_scaling_d100
 ```
 
 The scaling preset uses sides 64, 128, 256, 512, and 1024 with float32,
@@ -272,8 +304,9 @@ python -m phi4 --gpu \
   --output-prefix figures/phi4_gpu_suite
 ```
 
-The hardness map uses an available GPU automatically; its optional `--gpu`
-flag only requires that a GPU be visible and does not change its grid.
+The budget-scaling and hardness-map `--gpu` flags require a visible GPU but do
+not alter their scientific settings. The budget-scaling defaults are intended
+for a large-memory accelerator; use `--quick` for a local smoke test.
 
 ## Library use and reproducibility
 
