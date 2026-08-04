@@ -124,13 +124,13 @@ def add_sampler_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--chains",
         type=int,
-        default=512,
+        default=1024,
         help="Independent chains n used at every stage.",
     )
     parser.add_argument(
         "--steps",
         type=int,
-        default=128,
+        default=512,
         help="ULMC transitions N per stage.",
     )
     parser.add_argument(

@@ -66,11 +66,12 @@ def _phi4_parameter_subtitle(args: argparse.Namespace) -> str:
     """Return concise target and method-budget metadata for phi4 plots."""
 
     radius_text = r"\infty" if np.isposinf(args.radius) else f"{args.radius:g}"
-    design_text = (
-        rf",\ R_{{\rm design}}={args.cooling_design_radius:g}"
-        if np.isposinf(args.radius)
-        else ""
-    )
+    # design_text = (
+    #     rf",\ R_{{\rm design}}={args.cooling_design_radius:g}"
+    #     if np.isposinf(args.radius)
+    #     else ""
+    # )
+    design_text = ""
     return (
         rf"$\beta={args.beta:g},\ \lambda={args.quartic:g},\ "
         + rf"m={args.mass:g},\ R={radius_text}"

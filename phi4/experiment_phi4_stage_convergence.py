@@ -265,14 +265,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--beta", type=float, default=2.0)
     parser.add_argument("--quartic", type=float, default=0.5)
-    parser.add_argument("--mass", type=float, default=0.25)
-    parser.add_argument("--radius", type=float, default=2.0)
+    parser.add_argument("--mass", type=float, default=0.01)
+    parser.add_argument("--radius", type=float, default=4.0)
     parser.add_argument("--cooling-design-radius", type=float, default=4.0)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--chains", type=int, default=512)
-    parser.add_argument("--steps", type=int, default=64)
-    parser.add_argument("--stages", type=int, default=8)
-    parser.add_argument("--cooling-gamma", type=float, default=0.35)
+    parser.add_argument("--steps", type=int, default=256)
+    parser.add_argument("--stages", type=int, default=12)
+    parser.add_argument("--cooling-gamma", type=float, default=0.03)
     parser.add_argument("--delta", type=float, default=0.25)
     parser.add_argument("--friction", type=float, default=1.0)
     parser.add_argument("--step-size", type=float, default=0.03)
@@ -323,12 +323,12 @@ def apply_presets(args: argparse.Namespace, explicit: set[str]) -> None:
             "sides": list(GPU_STAGE_COMPARISON_SIDES),
             "key_side_order": [64, 128, 256, 512, 1024],
             "repeats": 1,
-            "chains": 64,
-            "steps": 32,
-            "stages": 8,
+            "chains": 512,
+            "steps": 256,
+            "stages": 12,
             "dense_max_side": 0,
-            "reference_chains": 128,
-            "reference_steps": 128,
+            "reference_chains": 512,
+            "reference_steps": 256,
             "dtype": "float32",
         }
     for destination, value in values.items():

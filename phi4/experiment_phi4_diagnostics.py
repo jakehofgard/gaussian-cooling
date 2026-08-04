@@ -654,7 +654,7 @@ def make_figures(
             radial_median,
             color="#009E73",
             linewidth=1.8,
-            label="Annular median and IQR",
+            label="Median IAT",
         )
     ax.set_xlabel("Periodic distance from the origin")
     ax.set_ylabel(r"Integrated autocorrelation time $\tau_{\rm int}$ (ULMC steps)")
@@ -813,7 +813,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.5,
         help="Quartic coupling lambda.",
     )
-    parser.add_argument("--mass", type=float, default=0.25)
+    parser.add_argument("--mass", type=float, default=0.01)
     parser.add_argument(
         "--radius",
         type=float,
@@ -828,15 +828,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--chains", type=int, default=512)
-    parser.add_argument("--steps", type=int, default=64)
-    parser.add_argument("--stages", type=int, default=8)
-    parser.add_argument("--cooling-gamma", type=float, default=0.35)
+    parser.add_argument("--steps", type=int, default=256)
+    parser.add_argument("--stages", type=int, default=12)
+    parser.add_argument("--cooling-gamma", type=float, default=0.03)
     parser.add_argument("--delta", type=float, default=0.25)
     parser.add_argument("--friction", type=float, default=1.0)
     parser.add_argument("--step-size", type=float, default=0.03)
     parser.add_argument("--covariance-ridge", type=float, default=0.0)
     parser.add_argument("--metric-floor", type=float, default=1e-10)
-    parser.add_argument("--reference-chains", type=int, default=256)
+    parser.add_argument("--reference-chains", type=int, default=512)
     parser.add_argument("--reference-steps", type=int, default=256)
     parser.add_argument(
         "--reference-step-size",
@@ -844,8 +844,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Reference ULMC step size; by default reuse --step-size.",
     )
-    parser.add_argument("--trajectory-burnin", type=int, default=1024)
-    parser.add_argument("--trajectory-samples", type=int, default=8192)
+    parser.add_argument("--trajectory-burnin", type=int, default=10000)
+    parser.add_argument("--trajectory-samples", type=int, default=100000)
     parser.add_argument("--iat-tolerance", type=int, default=50)
     parser.add_argument("--trajectory-chunk-size", type=int, default=256)
     parser.add_argument("--iat-batch-size", type=int, default=64)

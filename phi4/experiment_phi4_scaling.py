@@ -281,7 +281,7 @@ def make_scaling_figures(
     ax.xaxis.set_minor_formatter(NullFormatter())
     ax.set_xlabel(r"Lattice side length $d$")
     ax.set_ylabel(r"Relative condition number $\kappa_{\mathrm{rel}}$")
-    ax.set_title(r"$\kappa_{\mathrm{rel}}$ vs. $d$\n" + _phi4_parameter_subtitle(args))
+    ax.set_title(r"$\kappa_{\mathrm{rel}}$ vs. $d$" + "\n" + _phi4_parameter_subtitle(args))
     ax.grid(which="major", color="#D8D8D8", linewidth=0.55, alpha=0.8)
     ax.legend(
         frameon=False,
@@ -401,7 +401,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--quartic", type=float, default=0.5, help="Quartic coupling lambda."
     )
-    parser.add_argument("--mass", type=float, default=0.25)
+    parser.add_argument("--mass", type=float, default=0.01)
     parser.add_argument(
         "--radius",
         type=float,
@@ -411,19 +411,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cooling-design-radius", type=float, default=4.0)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--chains", type=int, default=512)
-    parser.add_argument("--steps", type=int, default=64)
-    parser.add_argument("--stages", type=int, default=8)
-    parser.add_argument("--cooling-gamma", type=float, default=0.35)
+    parser.add_argument("--steps", type=int, default=256)
+    parser.add_argument("--stages", type=int, default=12)
+    parser.add_argument("--cooling-gamma", type=float, default=0.03)
     parser.add_argument("--delta", type=float, default=0.25)
     parser.add_argument("--friction", type=float, default=1.0)
-    parser.add_argument("--step-size", type=float, default=0.03)
+    parser.add_argument("--step-size", type=float, default=0.01)
     parser.add_argument("--covariance-ridge", type=float, default=0.0)
     parser.add_argument("--metric-floor", type=float, default=1e-10)
     parser.add_argument("--metric-ridge", type=float, default=0.0)
     parser.add_argument("--dense-max-side", type=int, default=20)
-    parser.add_argument("--reference-chains", type=int, default=256)
+    parser.add_argument("--reference-chains", type=int, default=512)
     parser.add_argument("--reference-steps", type=int, default=256)
-    parser.add_argument("--reference-step-size", type=float, default=None)
+    parser.add_argument("--reference-step-size", type=float, default=0.01)
     parser.add_argument("--dtype", choices=("float32", "float64"), default="float32")
     parser.add_argument("--seed", type=int, default=271828)
     parser.add_argument(
@@ -472,12 +472,12 @@ def apply_presets(
         values = {
             "sides": list(GPU_LATTICE_SIDES),
             "repeats": 1,
-            "chains": 64,
-            "steps": 32,
-            "stages": 8,
+            "chains": 512,
+            "steps": 256,
+            "stages": 12,
             "dense_max_side": 0,
-            "reference_chains": 128,
-            "reference_steps": 128,
+            "reference_chains": 512,
+            "reference_steps": 256,
             "dtype": "float32",
         }
     for destination, value in values.items():

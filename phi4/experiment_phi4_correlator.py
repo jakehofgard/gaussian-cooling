@@ -816,13 +816,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--trajectory-burnin",
         type=int,
-        default=1024,
+        default=10000,
         help="Burn-in transitions for each matched post-learning chain.",
     )
     parser.add_argument(
         "--trajectory-samples",
         type=int,
-        default=8192,
+        default=1000000,
         help="Retained samples in each matched post-learning chain.",
     )
     parser.add_argument(
@@ -834,7 +834,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--trajectory-chunk-size",
         type=int,
-        default=256,
+        default=512,
         help="Consecutive trajectory transitions per compiled JAX scan.",
     )
     add_execution_arguments(

@@ -4,7 +4,7 @@ This focused experiment fixes ``beta=2`` and the truncation radius ``R=4``,
 then varies the mass ``m``, quartic coupling ``lambda``, and lattice side
 length.  At every grid cell, three translation-invariant preconditioners use
 the same practitioner-selected gradient budget.  The default budget is
-``n=512`` chains, ``N=128`` ULMC transitions per stage, and ``K=12`` stages.
+``n=512`` chains, ``N=256`` ULMC transitions per stage, and ``K=12`` stages.
 
 The script writes two vector PDFs per lattice side plus a compressed NPZ file
 containing all repeats and reference-sampler metadata.  Use ``--quick`` for a
@@ -390,11 +390,11 @@ def make_hardness_map_figures(
         method: np.median(values, axis=-1)
         for method, values in result.relative_conditions.items()
     }
-    absolute_log_values = np.concatenate(
-        [np.log10(values).reshape((-1,)) for values in medians.values()]
+    absolute_values = np.concatenate(
+        [values.reshape((-1,)) for values in medians.values()]
     )
-    absolute_min = float(np.min(absolute_log_values))
-    absolute_max = float(np.max(absolute_log_values))
+    absolute_min = float(np.min(absolute_values))
+    absolute_max = float(np.max(absolute_values))
     if np.isclose(absolute_min, absolute_max):
         absolute_min -= 0.5
         absolute_max += 0.5
@@ -436,7 +436,7 @@ def make_hardness_map_figures(
             absolute_image = ax.pcolormesh(
                 mass_edges,
                 quartic_edges,
-                np.log10(medians[method][side_index]),
+                medians[method][side_index],
                 cmap="viridis",
                 vmin=absolute_min,
                 vmax=absolute_max,
@@ -457,7 +457,7 @@ def make_hardness_map_figures(
             shrink=0.88,
             pad=0.02,
         )
-        absolute_colorbar.set_label(r"$\log_{10}(\widetilde{\kappa}_{\mathrm{rel}})$")
+        absolute_colorbar.set_label(r"$\kappa_{\mathrm{rel}})$")
         absolute_figure.suptitle(
             r"Lattice $\phi^4$ preconditioner quality" + "\n" + budget_text,
             fontsize=10.6,
@@ -692,7 +692,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--hardness-steps",
         dest="hardness_steps",
         type=int,
-        default=128,
+        default=256,
         help="Fixed transitions N per stage for every method.",
     )
     parser.add_argument(
