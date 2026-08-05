@@ -353,11 +353,17 @@ python -u -m phi4 --gpu \
   2>&1 | tee "${RUN_DIR}/phi4_gpu_suite.log"
 ```
 
-The focused budget-scaling experiment fixes $d=100$ and runs
-`(n,N)=(64,32),(128,64),(256,128),(512,256),(1024,512)`. Both coordinates
-increase together, so the result measures improvement with joint budget and
-does not separate the effects of more chains from longer chains. First run one
-repeat to compile every production shape and check cost:
+The focused budget-scaling experiment fixes $d=100$ and evaluates the full
+Cartesian product of chain counts
+`n=64,128,256,512,1024` and step counts `N=32,64,128,256,512`, for 25 total
+budget pairs. The heatmap places $n$, the number of independent chains at
+each cooling stage, on the horizontal axis. It places $N$, the number of ULMC
+transitions per chain at each stage, on the vertical axis. Each cell shows the
+median relative condition number over repeats with logarithmic color
+normalization. Rows therefore isolate the effect of increasing $n$ at fixed
+$N$, while columns isolate the effect of increasing $N$ at fixed $n$. First
+run one repeat to benchmark every production shape, check memory use, and
+populate the persistent JAX compilation cache configured above:
 
 ```bash
 python -u -m phi4.experiment_phi4_budget_scaling --gpu \
@@ -365,6 +371,9 @@ python -u -m phi4.experiment_phi4_budget_scaling --gpu \
   --output-prefix "${RUN_DIR}/phi4_budget_d100_benchmark" \
   2>&1 | tee "${RUN_DIR}/phi4_budget_d100_benchmark.log"
 ```
+
+If persistent JAX caching is not configured, the separate publication process
+will compile all 25 shapes again.
 
 If the reference consistency, runtime, and memory use are acceptable, run the
 five-repeat default for the publication figure:
@@ -375,11 +384,13 @@ python -u -m phi4.experiment_phi4_budget_scaling --gpu \
   2>&1 | tee "${RUN_DIR}/phi4_budget_d100.log"
 ```
 
-The run writes one vector PDF ending in `_budget_scaling_d100.pdf` and one NPZ
-ending in `_budget_scaling_d100_data.npz`. The NPZ contains all learned
-spectra, repeat-level relative condition numbers, timings, budgets, and
+The run writes one vector PDF ending in `_budget_heatmap_d100.pdf` and one NPZ
+ending in `_budget_grid_d100_data.npz`. The NPZ contains all learned spectra,
+repeat-level relative condition numbers, timings, both grid axes, and
 reference metadata. The default shared reference uses 4,096 chains and derives
-a stable step size from the transformed target curvature.
+a stable step size from the transformed target curvature. Override either grid
+axis with comma-separated values, for example
+`--chain-counts 64,128,256 --step-counts 32,64,128`.
 
 If the first run fits comfortably, increase precision deliberately, for
 example:

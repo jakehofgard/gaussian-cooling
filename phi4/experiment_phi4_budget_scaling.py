@@ -1,17 +1,16 @@
-"""Joint chain-and-step scaling for translation-invariant Gaussian cooling.
+"""Chain-and-step budget heatmap for translation-invariant Gaussian cooling.
 
 This focused experiment fixes one periodic lattice :math:`\phi^4` target and
-increases the number of independent chains ``n`` and ULMC transitions per
-chain and stage ``N`` along a user-specified budget path.  Every estimate is
-evaluated against the same independently sampled, translation-invariant
-reference covariance.  The default path is
+varies the number of independent chains ``n`` and ULMC transitions per chain
+and stage ``N`` over a Cartesian grid.  Every estimate is evaluated against
+the same independently sampled, translation-invariant reference covariance.
+The default axes are
 
-``(n, N) = (64, 32), (128, 64), (256, 128), (512, 256), (1024, 512)``
+``n = 64, 128, 256, 512, 1024`` and ``N = 32, 64, 128, 256, 512``
 
-at lattice side length ``d=100``.  The experiment writes one vector PDF and a
-compressed NPZ file containing all repeats, timings, and reference metadata.
-The path changes ``n`` and ``N`` together; it demonstrates joint budget
-scaling rather than identifying their separate effects.
+at lattice side length ``d=100``, giving 25 method configurations.  The
+experiment writes one vector-PDF heatmap and a compressed NPZ file containing
+all repeats, learned spectra, timings, and reference metadata.
 """
 
 from __future__ import annotations
@@ -43,27 +42,24 @@ from .lattice_phi4 import (
 )
 from .phi4_cli import _available_gpu_devices, _explicit_cli_destinations
 from .phi4_plotting import (
-    BLUE,
     _configure_plot_style,
+    _logarithmic_cell_edges,
     save_publication_figures,
 )
 
 import matplotlib.pyplot as plt
+from matplotlib.colors import LogNorm
 
 
-DEFAULT_BUDGETS = (
-    (64, 32),
-    (128, 64),
-    (256, 128),
-    (512, 256),
-    (1024, 512),
-)
-QUICK_BUDGETS = ((8, 4), (16, 8), (32, 16))
+DEFAULT_CHAIN_COUNTS = (64, 128, 256, 512, 1024)
+DEFAULT_STEP_COUNTS = (32, 64, 128, 256, 512)
+QUICK_CHAIN_COUNTS = (8, 16)
+QUICK_STEP_COUNTS = (4, 8)
 
 
 @dataclass
 class BudgetScalingResult:
-    """Preconditioner quality and runtime along a joint ``(n, N)`` path."""
+    """Preconditioner quality on a Cartesian ``N``-by-``n`` budget grid."""
 
     side: int
     chains: np.ndarray
@@ -83,8 +79,24 @@ class BudgetScalingResult:
     elapsed_seconds: float
 
 
-def _parse_budgets(value: str) -> tuple[tuple[int, int], ...]:
-    """Parse comma-separated ``chains:steps`` pairs."""
+def _parse_integer_grid(value: str) -> tuple[int, ...]:
+    """Parse a comma-separated grid of distinct positive integers."""
+
+    try:
+        values = tuple(int(item.strip()) for item in value.split(",") if item.strip())
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "Expected comma-separated positive integers, for example 64,128,256."
+        ) from exc
+    if not values or any(item < 1 for item in values):
+        raise argparse.ArgumentTypeError("Grid values must be positive integers.")
+    if len(set(values)) != len(values):
+        raise argparse.ArgumentTypeError("Grid values must be unique.")
+    return values
+
+
+def _parse_budget_pairs(value: str) -> tuple[tuple[int, int], ...]:
+    """Parse the former comma-separated ``chains:steps`` path syntax."""
 
     pairs: list[tuple[int, int]] = []
     try:
@@ -98,16 +110,14 @@ def _parse_budgets(value: str) -> tuple[tuple[int, int], ...]:
             pairs.append((int(fields[0]), int(fields[1])))
     except ValueError as exc:
         raise argparse.ArgumentTypeError(
-            "Expected comma-separated chains:steps pairs, for example " "64:32,128:64."
+            "Expected chains:steps pairs, for example 64:32,128:64."
         ) from exc
-    if not pairs:
-        raise argparse.ArgumentTypeError("At least one budget pair is required.")
-    if any(chains < 2 or steps < 1 for chains, steps in pairs):
+    if not pairs or any(chains < 2 or steps < 1 for chains, steps in pairs):
         raise argparse.ArgumentTypeError(
-            "Each pair requires at least two chains and one step."
+            "Each legacy budget pair requires at least two chains and one step."
         )
     if len(set(pairs)) != len(pairs):
-        raise argparse.ArgumentTypeError("Budget pairs must be unique.")
+        raise argparse.ArgumentTypeError("Legacy budget pairs must be unique.")
     return tuple(pairs)
 
 
@@ -161,11 +171,12 @@ def run_budget_scaling_experiment(
     )
     validate_lattice_model(model)
 
-    chains = np.asarray([pair[0] for pair in args.budgets], dtype=int)
-    steps = np.asarray([pair[1] for pair in args.budgets], dtype=int)
-    relative_conditions = np.empty((len(args.budgets), args.repeats), dtype=float)
+    chains = np.asarray(args.chain_counts, dtype=int)
+    steps = np.asarray(args.step_counts, dtype=int)
+    grid_shape = (len(steps), len(chains), args.repeats)
+    relative_conditions = np.empty(grid_shape, dtype=float)
     estimated_spectra = np.empty(
-        (len(args.budgets), args.repeats, model.dimension),
+        grid_shape + (model.dimension,),
         dtype=np.float64,
     )
     runtimes = np.empty_like(relative_conditions)
@@ -208,35 +219,45 @@ def run_budget_scaling_experiment(
         args.metric_floor,
     )
 
-    for budget_index, (num_chains, num_steps) in enumerate(args.budgets):
-        budget_args = argparse.Namespace(**vars(args))
-        budget_args.chains = num_chains
-        budget_args.steps = num_steps
-        budget_key = random.fold_in(random.fold_in(method_key, num_chains), num_steps)
-        repeat_keys = [
-            random.fold_in(budget_key, repeat) for repeat in range(args.repeats)
-        ]
-        print(
-            f"Budget {budget_index + 1}/{len(args.budgets)}: "
-            f"n={num_chains}, N={num_steps}, K={args.stages}",
-            flush=True,
-        )
-        for repeat, key in enumerate(repeat_keys):
-            repeat_started = time.perf_counter()
-            spectrum = _fourier_cooling_call(
-                key,
-                model,
-                budget_args,
+    num_cells = len(chains) * len(steps)
+    for step_index, num_steps in enumerate(steps):
+        for chain_index, num_chains in enumerate(chains):
+            cell_args = argparse.Namespace(**vars(args))
+            cell_args.chains = int(num_chains)
+            cell_args.steps = int(num_steps)
+            cell_key = random.fold_in(
+                random.fold_in(method_key, int(num_chains)),
+                int(num_steps),
             )
-            spectrum.block_until_ready()
-            runtimes[budget_index, repeat] = time.perf_counter() - repeat_started
-            spectrum_array = np.asarray(spectrum)
-            estimated_spectra[budget_index, repeat] = spectrum_array
-            relative_conditions[budget_index, repeat] = spectral_relative_condition(
-                spectrum_array,
-                reference_spectrum,
-                args.metric_floor,
+            repeat_keys = [
+                random.fold_in(cell_key, repeat) for repeat in range(args.repeats)
+            ]
+            cell_index = step_index * len(chains) + chain_index
+            print(
+                f"Budget cell {cell_index + 1}/{num_cells}: "
+                f"n={num_chains}, N={num_steps}, K={args.stages}",
+                flush=True,
             )
+            for repeat, key in enumerate(repeat_keys):
+                repeat_started = time.perf_counter()
+                spectrum = _fourier_cooling_call(
+                    key,
+                    model,
+                    cell_args,
+                )
+                spectrum.block_until_ready()
+                runtimes[step_index, chain_index, repeat] = (
+                    time.perf_counter() - repeat_started
+                )
+                spectrum_array = np.asarray(spectrum)
+                estimated_spectra[step_index, chain_index, repeat] = spectrum_array
+                relative_conditions[step_index, chain_index, repeat] = (
+                    spectral_relative_condition(
+                        spectrum_array,
+                        reference_spectrum,
+                        args.metric_floor,
+                    )
+                )
 
     return BudgetScalingResult(
         side=args.side,
@@ -262,41 +283,65 @@ def make_budget_scaling_figure(
     result: BudgetScalingResult,
     args: argparse.Namespace,
 ) -> dict[str, plt.Figure]:
-    """Create a clean median-and-IQR budget-scaling figure."""
+    """Create the median relative-condition heatmap over the budget grid."""
 
     _configure_plot_style()
-    figure, ax = plt.subplots(figsize=(6.4, 4.6), constrained_layout=True)
-    positions = np.arange(len(result.chains), dtype=float)
-    medians = np.median(result.relative_conditions, axis=1)
-    lower, upper = np.quantile(result.relative_conditions, (0.25, 0.75), axis=1)
-    ax.fill_between(positions, lower, upper, color=BLUE, alpha=0.16, linewidth=0)
-    ax.plot(
-        positions,
+    figure, ax = plt.subplots(figsize=(6.5, 5.25), constrained_layout=True)
+    medians = np.median(result.relative_conditions, axis=-1)
+    if np.any(~np.isfinite(medians)) or np.any(medians <= 0.0):
+        raise FloatingPointError(
+            "Budget-grid relative condition numbers must be finite and positive."
+        )
+    maximum = float(np.max(medians))
+    maximum = max(maximum, 1.01)
+    normalization = LogNorm(vmin=1.0, vmax=maximum)
+    image = ax.pcolormesh(
+        _logarithmic_cell_edges(result.chains),
+        _logarithmic_cell_edges(result.steps),
         medians,
-        color=BLUE,
-        marker="o",
-        linestyle="-",
-        markersize=4.5,
+        cmap="viridis",
+        norm=normalization,
+        shading="flat",
+        edgecolors=(1.0, 1.0, 1.0, 0.65),
+        linewidth=0.55,
     )
-    ax.axhline(1.0, color="#222222", linestyle=":", linewidth=0.9)
+    ax.set_xscale("log")
     ax.set_yscale("log")
-    ax.set_xlim(-0.25, len(positions) - 0.75)
-    ax.set_xticks(positions, [str(value) for value in result.chains])
+    ax.set_xticks(result.chains, [str(value) for value in result.chains])
+    ax.set_yticks(result.steps, [str(value) for value in result.steps])
+    ax.minorticks_off()
     ax.set_xlabel(r"Number of chains per stage $n$")
-    ax.set_ylabel(r"Relative condition number $\kappa_{\mathrm{rel}}$")
+    ax.set_ylabel(r"ULMC steps per chain and stage $N$")
+    ax.set_box_aspect(1.0)
+
+    for step_index, num_steps in enumerate(result.steps):
+        for chain_index, num_chains in enumerate(result.chains):
+            value = medians[step_index, chain_index]
+            red, green, blue, _ = image.cmap(normalization(value))
+            luminance = 0.2126 * red + 0.7152 * green + 0.0722 * blue
+            text_color = "white" if luminance < 0.5 else "#111111"
+            ax.text(
+                num_chains,
+                num_steps,
+                f"{value:.3g}",
+                ha="center",
+                va="center",
+                color=text_color,
+                fontsize=7.4,
+            )
+
+    colorbar = figure.colorbar(image, ax=ax, shrink=0.88, pad=0.025)
+    colorbar.set_label(r"Median relative condition number $\kappa_{\mathrm{rel}}$")
     radius_text = r"\infty" if np.isposinf(args.radius) else f"{args.radius:g}"
+    repeat_label = "repeat" if args.repeats == 1 else "repeats"
     ax.set_title(
-        "Translation-invariant Gaussian cooling: accuracy versus Monte Carlo budget\n"
+        "Translation-invariant Gaussian cooling: budget sensitivity\n"
         + rf"$d={result.side},\ D=d^2={result.side**2},\ "
         + rf"\beta={args.beta:g},\ \lambda={args.quartic:g},\ "
-        + rf"m={args.mass:g},\ R={radius_text},\ K={args.stages}$"
+        + rf"m={args.mass:g},\ R={radius_text},\ K={args.stages}$; "
+        + f"median of {args.repeats} {repeat_label}"
     )
-    ax.grid(which="major", color="#D8D8D8", linewidth=0.55, alpha=0.8)
-
-    top_axis = ax.secondary_xaxis("top")
-    top_axis.set_xticks(positions, [str(value) for value in result.steps])
-    top_axis.set_xlabel(r"ULMC steps per chain and stage $N$")
-    return {f"budget_scaling_d{result.side}": figure}
+    return {f"budget_heatmap_d{result.side}": figure}
 
 
 def save_budget_scaling_data(
@@ -309,15 +354,17 @@ def save_budget_scaling_data(
     output = output.expanduser().resolve()
     stem = output.with_suffix("") if output.suffix else output
     stem.parent.mkdir(parents=True, exist_ok=True)
-    path = stem.with_name(f"{stem.name}_budget_scaling_d{result.side}_data.npz")
+    path = stem.with_name(f"{stem.name}_budget_grid_d{result.side}_data.npz")
     np.savez_compressed(
         path,
         side=np.asarray(result.side),
         dimension=np.asarray(result.side**2),
-        chains=result.chains,
-        steps=result.steps,
+        chain_counts=result.chains,
+        step_counts=result.steps,
         stages=np.asarray(args.stages),
-        chain_transitions=result.chains * result.steps * args.stages,
+        chain_transitions=(
+            result.steps[:, None] * result.chains[None, :] * args.stages
+        ),
         repeats=np.asarray(args.repeats),
         relative_conditions=result.relative_conditions,
         estimated_spectra=result.estimated_spectra,
@@ -360,29 +407,49 @@ def save_budget_scaling_data(
         dtype=np.asarray(args.dtype),
         seed=np.asarray(args.seed),
         method=np.asarray(COOLING_COMPARISON),
-        budget_mode=np.asarray("joint_chain_and_step_path"),
+        budget_mode=np.asarray("cartesian_chain_step_grid"),
+        grid_axis_order=np.asarray("step_counts,chain_counts,repeats"),
+        relative_conditions_axis_order=np.asarray("step_counts,chain_counts,repeats"),
+        runtimes_axis_order=np.asarray("step_counts,chain_counts,repeats"),
+        estimated_spectra_axis_order=np.asarray(
+            "step_counts,chain_counts,repeats,fourier_mode"
+        ),
+        chain_transitions_axis_order=np.asarray("step_counts,chain_counts"),
         runtime_first_repeat_includes_compilation=np.asarray(True),
     )
     return path
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """Build the joint budget-scaling CLI."""
+    """Build the Cartesian budget-grid CLI."""
 
     parser = argparse.ArgumentParser(
         description=(
             "Measure translation-invariant Gaussian-cooling quality while "
-            "jointly increasing chains n and steps per chain and stage N."
+            "varying chains n and steps per chain and stage N over a grid."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--side", type=int, default=100)
     parser.add_argument(
+        "--chain-counts",
+        type=_parse_integer_grid,
+        default=DEFAULT_CHAIN_COUNTS,
+        metavar="C1,C2,...",
+        help="Increasing chain counts n forming the horizontal heatmap axis.",
+    )
+    parser.add_argument(
+        "--step-counts",
+        type=_parse_integer_grid,
+        default=DEFAULT_STEP_COUNTS,
+        metavar="S1,S2,...",
+        help="Increasing ULMC step counts N forming the vertical heatmap axis.",
+    )
+    parser.add_argument(
         "--budgets",
-        type=_parse_budgets,
-        default=DEFAULT_BUDGETS,
-        metavar="CHAINS:STEPS,...",
-        help="Ordered joint budget path.",
+        type=_parse_budget_pairs,
+        default=None,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument("--beta", type=float, default=2.0)
     parser.add_argument("--quartic", type=float, default=0.5)
@@ -462,7 +529,8 @@ def apply_presets(args: argparse.Namespace, explicit: set[str]) -> None:
         return
     quick_values: dict[str, object] = {
         "side": 4,
-        "budgets": QUICK_BUDGETS,
+        "chain_counts": QUICK_CHAIN_COUNTS,
+        "step_counts": QUICK_STEP_COUNTS,
         "repeats": 1,
         "stages": 2,
         "reference_chains": 64,
@@ -474,21 +542,44 @@ def apply_presets(args: argparse.Namespace, explicit: set[str]) -> None:
             setattr(args, destination, value)
 
 
+def apply_legacy_budget_grid(args: argparse.Namespace, explicit: set[str]) -> None:
+    """Map the former diagonal-path syntax to a Cartesian grid with a warning."""
+
+    if args.budgets is None:
+        return
+    if "chain_counts" in explicit or "step_counts" in explicit:
+        raise ValueError(
+            "Do not combine deprecated --budgets with --chain-counts or "
+            "--step-counts."
+        )
+    args.chain_counts = tuple(sorted({pair[0] for pair in args.budgets}))
+    args.step_counts = tuple(sorted({pair[1] for pair in args.budgets}))
+    warnings.warn(
+        "--budgets is deprecated. Its unique chain and step coordinates now "
+        "define a Cartesian grid, not a diagonal path; use --chain-counts "
+        "and --step-counts instead.",
+        FutureWarning,
+        stacklevel=2,
+    )
+
+
 def validate_arguments(args: argparse.Namespace) -> None:
-    """Validate target, budget-path, sampler, and execution settings."""
+    """Validate target, budget-grid, sampler, and execution settings."""
 
     if args.side < 2:
         raise ValueError("--side must be at least two.")
-    if len(set(args.budgets)) != len(args.budgets):
-        raise ValueError("Budget pairs must be unique.")
-    chains = np.asarray([pair[0] for pair in args.budgets], dtype=int)
-    steps = np.asarray([pair[1] for pair in args.budgets], dtype=int)
+    chains = np.asarray(args.chain_counts, dtype=int)
+    steps = np.asarray(args.step_counts, dtype=int)
+    if len(chains) == 0 or len(steps) == 0:
+        raise ValueError("The chain-count and step-count grids cannot be empty.")
+    if len(set(chains)) != len(chains) or len(set(steps)) != len(steps):
+        raise ValueError("Chain-count and step-count grid values must be unique.")
     if np.any(chains < 2) or np.any(steps < 1):
-        raise ValueError("Each budget requires n >= 2 and N >= 1.")
-    if len(chains) > 1 and (
-        np.any(np.diff(chains) <= 0) or np.any(np.diff(steps) <= 0)
-    ):
-        raise ValueError("--budgets must strictly increase both the chains and steps.")
+        raise ValueError("The grid requires every n >= 2 and every N >= 1.")
+    if len(chains) > 1 and np.any(np.diff(chains) <= 0):
+        raise ValueError("--chain-counts must be strictly increasing.")
+    if len(steps) > 1 and np.any(np.diff(steps) <= 0):
+        raise ValueError("--step-counts must be strictly increasing.")
     positive = {
         "quartic": args.quartic,
         "mass": args.mass,
@@ -554,29 +645,41 @@ def print_summary(
 ) -> None:
     """Print quality, runtime, reference, and trend summaries."""
 
-    print("\nJoint budget-scaling results")
-    print(
-        "n".rjust(8)
-        + "N".rjust(8)
-        + "K*n*N".rjust(14)
-        + "median kappa_rel".rjust(20)
-        + "IQR".rjust(20)
-        + "median s".rjust(13)
+    print("\nMedian relative condition numbers (rows N, columns n)")
+    medians = np.median(result.relative_conditions, axis=-1)
+    header = "N \\ n".rjust(10) + "".join(
+        f"{num_chains:>12d}" for num_chains in result.chains
     )
-    medians = np.median(result.relative_conditions, axis=1)
-    lower, upper = np.quantile(result.relative_conditions, (0.25, 0.75), axis=1)
-    for index, (chains, steps) in enumerate(zip(result.chains, result.steps)):
+    print(header)
+    for step_index, num_steps in enumerate(result.steps):
         print(
-            f"{chains:8d}{steps:8d}{chains * steps * args.stages:14d}"
-            f"{medians[index]:20.5g}"
-            f"{f'[{lower[index]:.4g}, {upper[index]:.4g}]':>20}"
-            f"{np.median(result.runtimes[index]):13.4g}"
+            f"{num_steps:>10d}"
+            + "".join(f"{value:>12.4g}" for value in medians[step_index])
         )
-    improving = int(np.count_nonzero(np.diff(medians) < 0.0))
-    comparisons = max(len(medians) - 1, 0)
+
+    improving_chains = int(np.count_nonzero(np.diff(medians, axis=1) < 0.0))
+    chain_comparisons = medians.shape[0] * max(medians.shape[1] - 1, 0)
+    improving_steps = int(np.count_nonzero(np.diff(medians, axis=0) < 0.0))
+    step_comparisons = max(medians.shape[0] - 1, 0) * medians.shape[1]
     print(
-        f"Improving adjacent median comparisons: {improving}/{comparisons}. "
-        "Because both n and N change, this is a joint-budget trend."
+        "Improving adjacent medians when increasing n at fixed N: "
+        f"{improving_chains}/{chain_comparisons}."
+    )
+    print(
+        "Improving adjacent medians when increasing N at fixed n: "
+        f"{improving_steps}/{step_comparisons}."
+    )
+    best_step, best_chain = np.unravel_index(np.argmin(medians), medians.shape)
+    worst_step, worst_chain = np.unravel_index(np.argmax(medians), medians.shape)
+    print(
+        "Best median cell: "
+        f"n={result.chains[best_chain]}, N={result.steps[best_step]}, "
+        f"kappa_rel={medians[best_step, best_chain]:.4g}."
+    )
+    print(
+        "Worst median cell: "
+        f"n={result.chains[worst_chain]}, N={result.steps[worst_step]}, "
+        f"kappa_rel={medians[worst_step, worst_chain]:.4g}."
     )
     print(
         "Half-reference consistency kappa_rel: "
@@ -586,7 +689,7 @@ def print_summary(
         f"Reference: n_ref={result.reference_chains}, "
         f"N_ref={result.reference_steps}, h_ref={result.reference_step_size:.4g}, "
         f"T_ref={result.reference_steps * result.reference_step_size:.4g}. "
-        "The first retained repeat at each budget includes JIT compilation."
+        "The first retained repeat at each grid cell includes JIT compilation."
     )
     print(f"Wall time including compilation: {result.elapsed_seconds:.2f}s")
 
@@ -598,6 +701,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     explicit = _explicit_cli_destinations(parser, arguments)
     try:
         apply_presets(args, explicit)
+        apply_legacy_budget_grid(args, explicit)
         validate_arguments(args)
     except (RuntimeError, ValueError) as exc:
         parser.error(str(exc))

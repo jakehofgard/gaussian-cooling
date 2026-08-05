@@ -29,7 +29,7 @@ value is one. Every figure is saved as a separate vector PDF.
 | `phi4/experiment_phi4_correlator.py` | Center-site two-point correlators under each preconditioner. |
 | `phi4/experiment_phi4_parameter_sweeps.py` | Controlled $\lambda$, $m$, and $R$ sweeps. |
 | `phi4/experiment_phi4_hardness_map.py` | Fixed-budget $(m,\lambda)$ hardness maps. |
-| `phi4/experiment_phi4_budget_scaling.py` | Joint chain-and-step convergence of translation-invariant Gaussian cooling. |
+| `phi4/experiment_phi4_budget_scaling.py` | Chain-by-step budget heatmap for translation-invariant Gaussian cooling. |
 | `phi4/__main__.py` | Convenience launcher for the complete lattice $\phi^4$ suite. |
 | `RUNPOD.md` | Cost-conscious H100 setup and production commands. |
 | `Dockerfile.runpod` | Optional reproducible NVIDIA container. |
@@ -147,7 +147,7 @@ Each experiment can be run independently with only its relevant options.
 | `phi4/experiment_phi4_correlator.py` | Center-site correlator decay under each feasible preconditioner | `_two_point_correlator_decay_d{d}.pdf` |
 | `phi4/experiment_phi4_parameter_sweeps.py` | One-factor $\lambda$, $m$, and $R$ comparisons | `_parameter_sweep_lambda.pdf`, `_parameter_sweep_mass.pdf`, `_parameter_sweep_radius.pdf`, `_truncation_to_quartic_covariance.pdf` |
 | `phi4/experiment_phi4_hardness_map.py` | Fixed-budget map over $(m,\lambda)$ at $R=4$, $\beta=2$ | `_hardness_absolute_d{d}.pdf`, `_hardness_adaptive_gain_d{d}.pdf`, `_hardness_map_data.npz` |
-| `phi4/experiment_phi4_budget_scaling.py` | Joint convergence as chains $n$ and steps $N$ increase at fixed $d=100$ | `_budget_scaling_d100.pdf`, `_budget_scaling_d100_data.npz` |
+| `phi4/experiment_phi4_budget_scaling.py` | Cartesian comparison of chain count $n$ and steps per chain and stage $N$ at fixed $d=100$ | `_budget_heatmap_d100.pdf`, `_budget_grid_d100_data.npz` |
 
 Default runs:
 
@@ -236,22 +236,28 @@ Check important runs with a larger design radius and smaller step size.
 
 The budget-scaling experiment fixes $d=100$, $\beta=2$, $\lambda=0.5$,
 $m=0.01$, $R=4$, and $K=12$. It evaluates translation-invariant Gaussian
-cooling along
+cooling on all 25 pairs in the Cartesian grid
 
 ```math
-(n,N)\in\{(64,32),(128,64),(256,128),(512,256),(1024,512)\}.
+n\in\{64,128,256,512,1024\},
+\qquad
+N\in\{32,64,128,256,512\}.
 ```
 
-The PDF shows the median relative condition number and interquartile range
-over five repeats, with chains $n$ on the lower axis and steps per chain and
-stage $N$ on the upper axis. One shared reference uses 4,096 independently
-preconditioned chains and an automatically stability-limited step size. The
-NPZ preserves every learned spectrum, relative condition, runtime, budget,
-and reference setting. Since $n$ and $N$ increase together, this tests
-convergence with joint computational budget; it does not identify their
-separate effects. Use `--budgets CHAINS:STEPS,...` to study another path.
-Because the default run is accelerator-scale, it is not part of the ordinary
-`python -m phi4` suite; invoke it directly or select it with
+The heatmap's horizontal axis is $n$, the number of independent chains at
+each cooling stage. Its vertical axis is $N$, the number of ULMC transitions
+per chain at each stage. Each cell's color is the median relative condition
+number over five repeats. The color normalization is logarithmic; smaller
+values, approaching one, indicate a better preconditioner. Because the full
+grid varies one coordinate while holding the other fixed, it reveals the
+separate empirical effects of additional chains and longer chains rather than
+only their joint effect along a diagonal path. One shared reference uses 4,096
+independently preconditioned chains and an automatically stability-limited
+step size. The NPZ preserves every learned spectrum, repeat-level relative
+condition number, runtime, grid coordinate, and reference setting. Use
+`--chain-counts C1,C2,...` and `--step-counts S1,S2,...` to change either
+axis. Because the default run is accelerator-scale, it is not part of the
+ordinary `python -m phi4` suite; invoke it directly or select it with
 `python -m phi4 --only budget`.
 
 The parameter-sweep defaults use side 10. They vary
@@ -305,8 +311,9 @@ python -m phi4 --gpu \
 ```
 
 The budget-scaling and hardness-map `--gpu` flags require a visible GPU but do
-not alter their scientific settings. The budget-scaling defaults are intended
-for a large-memory accelerator; use `--quick` for a local smoke test.
+not alter their scientific settings. The budget heatmap evaluates 25 budget
+pairs at five repeats per pair and is intended for a large-memory
+accelerator; use `--quick` for a local smoke test.
 
 ## Library use and reproducibility
 
