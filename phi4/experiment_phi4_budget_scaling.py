@@ -310,8 +310,8 @@ def make_budget_scaling_figure(
     ax.set_xticks(result.chains, [str(value) for value in result.chains])
     ax.set_yticks(result.steps, [str(value) for value in result.steps])
     ax.minorticks_off()
-    ax.set_xlabel(r"Number of chains per stage $n$")
-    ax.set_ylabel(r"ULMC steps per chain and stage $N$")
+    ax.set_xlabel(r"Number of chains per stage $(n)$")
+    ax.set_ylabel(r"ULMC steps per chain $(N)$")
     ax.set_box_aspect(1.0)
 
     for step_index, num_steps in enumerate(result.steps):
@@ -331,15 +331,14 @@ def make_budget_scaling_figure(
             )
 
     colorbar = figure.colorbar(image, ax=ax, shrink=0.88, pad=0.025)
-    colorbar.set_label(r"Median relative condition number $\kappa_{\mathrm{rel}}$")
+    colorbar.set_label(r"Relative condition number $\kappa_{\mathrm{rel}}$")
     radius_text = r"\infty" if np.isposinf(args.radius) else f"{args.radius:g}"
     repeat_label = "repeat" if args.repeats == 1 else "repeats"
     ax.set_title(
-        "Translation-invariant Gaussian cooling: budget sensitivity\n"
-        + rf"$d={result.side},\ D=d^2={result.side**2},\ "
+        "Scaling of translation-invariant Gaussian cooling\n"
+        + rf"$d={result.side},\ "
         + rf"\beta={args.beta:g},\ \lambda={args.quartic:g},\ "
-        + rf"m={args.mass:g},\ R={radius_text},\ K={args.stages}$; "
-        + f"median of {args.repeats} {repeat_label}"
+        + rf"m={args.mass:g},\ R={radius_text},\ K={args.stages}$"
     )
     return {f"budget_heatmap_d{result.side}": figure}
 
