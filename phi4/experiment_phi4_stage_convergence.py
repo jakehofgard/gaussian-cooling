@@ -1,4 +1,8 @@
-"""Stagewise convergence of lattice phi4 covariance preconditioners."""
+"""Stagewise convergence of lattice phi4 covariance preconditioners.
+
+Track covariance quality from the shared stage-zero initialization through
+equal-budget sampling stages. Each lattice side produces a separate PDF.
+"""
 
 from __future__ import annotations
 
@@ -57,7 +61,11 @@ from matplotlib.ticker import MaxNLocator
 
 @dataclass
 class StageConvergenceResult:
-    """Condition histories for all feasible methods at each lattice side."""
+    """Condition histories for all feasible methods at each lattice side.
+
+    ``conditions[side][method]`` has axes ``(stage, repeat)``, including
+    stage zero. Infeasible raw-covariance entries after stage zero remain NaN.
+    """
 
     sides: np.ndarray
     conditions: dict[int, dict[str, np.ndarray]]
@@ -89,6 +97,7 @@ def run_stage_convergence(args: argparse.Namespace) -> StageConvergenceResult:
             ),
         )
         validate_lattice_model(model)
+        # Presets can keep a side's seed aligned with a larger side sequence.
         key_side_index = side_index
         if args.key_side_order is not None:
             key_side_index = args.key_side_order.index(side)
@@ -124,6 +133,7 @@ def run_stage_convergence(args: argparse.Namespace) -> StageConvergenceResult:
         comparison = {
             method: np.full(stage_shape, np.nan, dtype=float) for method in FOUR_METHODS
         }
+        # All methods begin from the same isotropic covariance, L_design^-1 I.
         initial_spectrum = (
             np.ones(model.dimension, dtype=float) / model.design_smoothness
         )
@@ -141,6 +151,7 @@ def run_stage_convergence(args: argparse.Namespace) -> StageConvergenceResult:
             include_raw_covariances=(raw_reason is None),
         )
         for repeat in range(args.repeats):
+            # Pair adaptive methods with common random numbers within a repeat.
             comparison_key = random.fold_in(base_key, 60_000 + repeat)
             adaptive_histories = {
                 COOLING_COMPARISON: _fourier_stage_history(
@@ -180,6 +191,7 @@ def run_stage_convergence(args: argparse.Namespace) -> StageConvergenceResult:
                     )
             if raw_history_array is not None:
                 assert reference_covariance is not None
+                # Raw histories contain sampled stages 1..K; stage zero is set above.
                 for stage_index, covariance in enumerate(raw_history_array, start=1):
                     comparison[RAW_ULMC][stage_index, repeat] = (
                         dense_relative_condition(
@@ -246,10 +258,13 @@ def make_stage_figures(
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """Build the stage-history CLI with independent reference settings."""
+
     parser = argparse.ArgumentParser(
         description="Compare stagewise convergence of phi4 preconditioners.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+    # Target lattice and potential.
     parser.add_argument(
         "--sides",
         "--comparison-sides",
@@ -268,6 +283,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mass", type=float, default=0.01)
     parser.add_argument("--radius", type=float, default=4.0)
     parser.add_argument("--cooling-design-radius", type=float, default=4.0)
+
+    # Equal budgets for the compared methods and dense-covariance cutoff.
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--chains", type=int, default=2048)
     parser.add_argument("--steps", type=int, default=2048)
@@ -279,6 +296,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--covariance-ridge", type=float, default=0.0)
     parser.add_argument("--metric-floor", type=float, default=1e-10)
     parser.add_argument("--dense-max-side", type=int, default=20)
+
+    # Independent reference sampler and execution/output settings.
     parser.add_argument("--reference-chains", type=int, default=2048)
     parser.add_argument("--reference-steps", type=int, default=2048)
     parser.add_argument("--reference-step-size", type=float, default=0.001)
@@ -301,6 +320,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def apply_presets(args: argparse.Namespace, explicit: set[str]) -> None:
+    """Apply quick/GPU settings while preserving explicit CLI options."""
+
     if args.quick and args.gpu:
         raise ValueError("--quick and --gpu are mutually exclusive presets.")
     values: dict[str, object] = {}
@@ -339,6 +360,8 @@ def apply_presets(args: argparse.Namespace, explicit: set[str]) -> None:
 
 
 def validate_arguments(args: argparse.Namespace) -> None:
+    """Check target, sampler, reference, and optional GPU requirements."""
+
     scalars = (
         args.quartic,
         args.mass,
@@ -403,6 +426,8 @@ def validate_arguments(args: argparse.Namespace) -> None:
 
 
 def print_summary(result: StageConvergenceResult) -> None:
+    """Report final-stage medians and reasons for omitted raw covariances."""
+
     print("\nFinal-stage median relative condition numbers")
     for side in result.sides:
         side = int(side)
@@ -418,6 +443,8 @@ def print_summary(result: StageConvergenceResult) -> None:
 
 
 def main(argv: Sequence[str] | None = None) -> None:
+    """Run stage histories and save one convergence PDF per lattice side."""
+
     arguments = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
     args = parser.parse_args(arguments)

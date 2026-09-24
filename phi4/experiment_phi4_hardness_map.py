@@ -67,7 +67,11 @@ import matplotlib.pyplot as plt
 
 @dataclass
 class HardnessMapResult:
-    """Scalable ``(mass, quartic coupling)`` maps at several lattice sides."""
+    """Scalable ``(mass, quartic coupling)`` maps at several lattice sides.
+
+    Method arrays have axes ``(side, quartic, mass, repeat)``. Reference
+    diagnostics use the first three axes, with one reference per grid cell.
+    """
 
     sides: np.ndarray
     masses: np.ndarray
@@ -102,7 +106,7 @@ def _hardness_budget(
     model: LatticeModel,
     args: argparse.Namespace,
 ) -> tuple[float, int, int]:
-    """Return ``(kappa_H, n, N)`` for one fixed-budget map target."""
+    """Return ``(kappa_H, n, N)`` without adapting the budget to hardness."""
 
     condition_bound = model.global_smoothness_bound / model.strong_convexity
     return (
@@ -117,7 +121,12 @@ def _hardness_reference_arguments(
     method_chains: int,
     args: argparse.Namespace,
 ) -> argparse.Namespace:
-    """Build stable, independently controlled reference-sampler settings."""
+    """Set reference chains and a curvature-limited integration step size.
+
+    Reference step counts retain the requested physical time as target
+    curvature changes. Reference chains obey both a minimum and a multiple
+    of the compared methods' chain count.
+    """
 
     reference_args = argparse.Namespace(**vars(args))
     transformed_smoothness = 1.0 + 3.0 * model.quartic * model.radius**2 / model.mass
@@ -145,6 +154,7 @@ def _evaluate_hardness_cell(
 ) -> _HardnessCellEvaluation:
     """Evaluate the three O(D)-storage methods at one map cell."""
 
+    # Pair adaptive methods with common keys; keep the reference independent.
     adaptive_root, plain_root, reference_key = random.split(key, 3)
     adaptive_warm_key, adaptive_run_root = random.split(adaptive_root)
     adaptive_keys = list(random.split(adaptive_run_root, args.hardness_repeats))
@@ -188,6 +198,7 @@ def _evaluate_hardness_cell(
     reference_spectrum = np.asarray(
         sample_power_spectrum(reference, model.lattice_shape)
     )
+    # Agreement between two reference halves diagnoses Monte Carlo uncertainty.
     reference_midpoint = reference.shape[0] // 2
     first_reference_spectrum = np.asarray(
         sample_power_spectrum(
@@ -292,6 +303,7 @@ def run_hardness_map(args: argparse.Namespace) -> HardnessMapResult:
                 cell_args.chains = num_chains
                 cell_args.steps = num_steps
                 cell_args.stages = args.hardness_stages
+                # Each cell gets a distinct stream in side/quartic/mass order.
                 flat_cell_index = (
                     side_index * num_cells_per_side
                     + quartic_index * len(masses)
@@ -390,6 +402,7 @@ def make_hardness_map_figures(
         method: np.median(values, axis=-1)
         for method, values in result.relative_conditions.items()
     }
+    # Use common color limits so quality can be compared across all lattice sides.
     absolute_values = np.concatenate(
         [values.reshape((-1,)) for values in medians.values()]
     )
@@ -401,6 +414,7 @@ def make_hardness_map_figures(
 
     baseline = medians[TRANSLATION_AVERAGED_ULMC]
     gain_methods = (COOLING_COMPARISON, EMPIRICAL_COMPARISON)
+    # Positive log gain means a lower relative condition number than plain ULMC.
     gains = {method: np.log10(baseline / medians[method]) for method in gain_methods}
     gain_limit = max(float(np.max(np.abs(values))) for values in gains.values())
     gain_limit = max(gain_limit, 1e-6)
@@ -636,6 +650,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+    # Scientific grid; beta and the target radius are fixed module constants.
     parser.add_argument(
         "--sides",
         "--hardness-sides",
@@ -663,6 +678,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=[0.1, 0.5, 2.0],
         help="Vertical-axis quartic couplings.",
     )
+
+    # Every method receives the same budget at every grid cell.
     parser.add_argument(
         "--stages",
         "--hardness-stages",
@@ -695,6 +712,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=256,
         help="Fixed transitions N per stage for every method.",
     )
+
+    # Reference sampling is tuned independently of the compared-method budget.
     parser.add_argument(
         "--reference-chain-factor",
         "--hardness-reference-chain-factor",
@@ -746,6 +765,8 @@ def build_parser() -> argparse.ArgumentParser:
             "this value."
         ),
     )
+
+    # Method integration settings, numerical metrics, and execution/output controls.
     parser.add_argument(
         "--cooling-gamma",
         type=float,

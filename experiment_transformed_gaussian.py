@@ -111,6 +111,14 @@ class GaussianTarget:
 
 @dataclass
 class ExperimentResult:
+    """Condition-number sweep and convergence measurements by method.
+
+    ``relative_conditions`` arrays have axes ``(kappa, repeat)``;
+    ``convergence_conditions`` arrays have axes ``(stage, repeat)`` and
+    include the stage-zero initializer. ``exact_cooling_oracle`` has one
+    entry per displayed stage. Elapsed time includes JIT compilation.
+    """
+
     kappas: np.ndarray
     target_conditions: np.ndarray
     base_condition_number: float
@@ -118,6 +126,9 @@ class ExperimentResult:
     convergence_conditions: dict[str, np.ndarray]
     exact_cooling_oracle: np.ndarray
     elapsed_seconds: float
+
+
+# Target construction and analytic metric checks.
 
 
 def haar_orthogonal(rng: np.random.Generator, dimension: int) -> np.ndarray:
@@ -425,6 +436,9 @@ def exact_cooling_relative_conditions(
     return oracle
 
 
+# Equal-budget estimators and experiment orchestration.
+
+
 def staged_target_covariance(
     key: Array,
     target: GaussianTarget,
@@ -437,7 +451,12 @@ def staged_target_covariance(
     num_stages: int,
     covariance_ridge: float,
 ) -> Array:
-    """Adapt the covariance in stages without Gaussian cooling."""
+    """Adapt the covariance in stages on the unchanged target.
+
+    Each stage starts fresh independent chains using the previous stage's
+    covariance factor, then estimates the next covariance from endpoints
+    already expressed in the original target coordinates.
+    """
 
     dimension = minimizer.shape[0]
     dtype = minimizer.dtype
@@ -519,7 +538,7 @@ def estimate_all_methods(
         covariance_ridge=covariance_ridge,
     )
 
-    # Baseline (a) uses the same number of chains and total ULMC transitions.
+    # The plain baseline matches the total chain-by-transition budget n*N*K.
     plain_samples = ulmc(
         key_plain,
         target.potential,
@@ -699,7 +718,12 @@ def run_experiment(args: argparse.Namespace) -> ExperimentResult:
     )
 
 
+# Figures and output files.
+
+
 def _configure_plot_style() -> None:
+    """Use a consistent serif style for the two standalone figures."""
+
     plt.rcParams.update(
         {
             "font.family": "serif",
@@ -732,7 +756,7 @@ def make_figures(
     step_size: float,
     friction: float,
 ) -> dict[str, plt.Figure]:
-    """Create standalone publication figures for both diagnostics."""
+    """Plot median quality and convergence with interquartile bands."""
 
     _configure_plot_style()
     quality_figure, ax = plt.subplots(
@@ -842,7 +866,7 @@ def save_publication_figures(
     figures: dict[str, plt.Figure],
     output: Path,
 ) -> dict[str, Path]:
-    """Save every plot as a separate vector PDF."""
+    """Save each plot as ``<output-prefix>_<plot-name>.pdf``."""
 
     output = output.expanduser().resolve()
     stem = output.with_suffix("") if output.suffix else output
@@ -855,7 +879,12 @@ def save_publication_figures(
     return paths
 
 
+# Command-line parsing, presets, and validation.
+
+
 def _parse_positive_floats(value: str) -> list[float]:
+    """Parse distinct finite condition numbers, each at least one."""
+
     try:
         values = [float(part.strip()) for part in value.split(",") if part.strip()]
     except ValueError as exc:
@@ -872,6 +901,8 @@ def _parse_positive_floats(value: str) -> list[float]:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """Expose target, sampling, and output controls for the Gaussian benchmark."""
+
     script_dir = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser(
         description=(
@@ -1043,6 +1074,8 @@ def apply_quick_configuration(
 
 
 def validate_arguments(args: argparse.Namespace) -> None:
+    """Check budgets, dense covariance rank, and finite sampler parameters."""
+
     counts = {
         "dimension": args.dimension,
         "repeats": args.repeats,
@@ -1097,6 +1130,8 @@ def validate_arguments(args: argparse.Namespace) -> None:
 
 
 def print_summary(result: ExperimentResult) -> None:
+    """Print median condition numbers across repeats and total runtime."""
+
     column_widths = {method: max(29, len(method) + 2) for method in METHODS}
     header = (
         "kappa(B)".ljust(12)
@@ -1123,6 +1158,8 @@ def print_summary(result: ExperimentResult) -> None:
 
 
 def main(argv: Sequence[str] | None = None) -> None:
+    """Run both comparisons, save their figures, and print the summary."""
+
     arguments = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
     args = parser.parse_args(arguments)

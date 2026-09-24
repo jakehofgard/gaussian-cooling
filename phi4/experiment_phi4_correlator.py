@@ -89,7 +89,12 @@ from .phi4_plotting import (
 
 @dataclass
 class TwoPointCorrelatorResult:
-    """Center-site correlators from matched preconditioned ULMC chains."""
+    """Center-site correlators from matched preconditioned ULMC chains.
+
+    Correlation fields have lattice shape ``(side, side)``. Radial arrays
+    contain one value per exact periodic-distance shell, in the order given
+    by ``shell_distances``. Field and radial dictionaries share method keys.
+    """
 
     side: int
     center: tuple[int, int]
@@ -116,7 +121,11 @@ class _CenterCorrelatorEstimate:
 
 @dataclass
 class _LearnedPreconditioners:
-    """Representative preconditioners and their selection diagnostics."""
+    """Representative preconditioners and their selection diagnostics.
+
+    Each preconditioner pairs its array with a flag indicating whether it is
+    a translation-invariant spectrum (True) or a dense covariance (False).
+    """
 
     preconditioners: dict[str, tuple[np.ndarray, bool]]
     reference_spectrum: np.ndarray
@@ -128,7 +137,11 @@ def _estimate_integrated_times(
     observables: np.ndarray,
     iat_tolerance: int,
 ) -> np.ndarray:
-    """Estimate one IAT per observable, retaining short-chain estimates."""
+    """Estimate IATs for an array shaped ``(samples, observables)``.
+
+    Keep estimates even when emcee reports a chain that is too short. The
+    caller separately marks reliability using the requested tolerance.
+    """
 
     if integrated_time is None:
         raise RuntimeError(
@@ -164,7 +177,12 @@ def _estimate_center_correlator(
     *,
     translation_invariant: bool,
 ) -> _CenterCorrelatorEstimate:
-    """Estimate a center covariance row and shellwise MC uncertainty."""
+    """Estimate a connected center covariance row and shellwise uncertainty.
+
+    Accumulate full-field moments as the chain runs. Retain only the center
+    field and shell-average time series for the IAT-adjusted Monte Carlo
+    standard errors, avoiding storage of the complete lattice trajectory.
+    """
 
     center = (model.side // 2, model.side // 2)
     center_index = center[0] * model.side + center[1]
@@ -247,6 +265,8 @@ def _estimate_center_correlator(
         *,
         emit_fields: bool,
     ) -> tuple[tuple[Array, Array, Array, Array], Array | None]:
+        """Cache scans by length and whether they retain physical fields."""
+
         runner_key = (length, emit_fields)
         if runner_key not in runners:
             transition = sampling_transition if emit_fields else burnin_transition
@@ -307,6 +327,7 @@ def _estimate_center_correlator(
         )
         sample_start = sample_stop
 
+    # Subtract the product of empirical means to estimate connected covariance.
     center_mean = float(np.mean(center_series))
     field_mean = field_sum / num_samples
     correlation_row = center_field_sum / num_samples - center_mean * field_mean
@@ -314,6 +335,7 @@ def _estimate_center_correlator(
         shell_series - np.mean(shell_series, axis=0, keepdims=True)
     )
     radial_correlation = np.mean(centered_shell_observables, axis=0)
+    # Averaging the covariance field over a shell must match the shell estimate.
     field_radial_correlation = np.asarray(
         [np.mean(correlation_row[sites]) for sites in shell_indices]
     )
@@ -340,6 +362,7 @@ def _estimate_center_correlator(
         & np.isfinite(radial_variances)
         & (radial_variances >= 0.0)
     )
+    # A finite IAT yields an MCSE even if the chain is too short for reliability.
     radial_standard_error = np.full(len(shell_indices), np.nan)
     radial_standard_error[valid_iats] = np.sqrt(
         radial_variances[valid_iats] * radial_iats[valid_iats] / num_samples
@@ -362,7 +385,12 @@ def run_two_point_correlator_experiment(
     skipped_methods: dict[str, str],
     args: argparse.Namespace,
 ) -> TwoPointCorrelatorResult:
-    """Compare center-site correlators under matched sampling budgets."""
+    """Compare center-site correlators under matched sampling budgets.
+
+    Every feasible method receives the same burn-in and retained sample
+    counts, with its own reproducible trajectory key. The independent
+    reference spectrum supplies the common comparison covariance field.
+    """
 
     center = (model.side // 2, model.side // 2)
     shell_distances, shell_indices = _periodic_distance_shells(
@@ -395,6 +423,7 @@ def run_two_point_correlator_experiment(
         radial_standard_errors[method] = estimate.radial_standard_error
         radial_reliable[method] = estimate.radial_reliable
 
+    # Applying the reference covariance to a center impulse extracts its column.
     center_basis = (
         jnp.zeros(model.dimension, dtype=model.dtype)
         .at[center[0] * model.side + center[1]]
@@ -430,9 +459,14 @@ def _learn_preconditioners(
     args: argparse.Namespace,
     root_key: Array,
 ) -> _LearnedPreconditioners:
-    """Learn and select one representative preconditioner per method."""
+    """Learn each method and select the repeat nearest its median condition.
 
-    # A focused one-side invocation matches the legacy `--sides d` key path.
+    Relative conditions use an independent reference sample. The dense raw
+    covariance method is omitted when its estimate is rank deficient or the
+    lattice exceeds the requested dense-computation cutoff.
+    """
+
+    # Preserve the random-key path used by earlier single-side experiments.
     base_key = random.fold_in(root_key, 0)
     key_warm_fourier = random.fold_in(base_key, 10_001)
     key_reference = random.fold_in(base_key, 10_003)
@@ -445,6 +479,8 @@ def _learn_preconditioners(
     empirical_root = random.fold_in(base_key, 80_000)
     key_warm_empirical, key_empirical_runs = random.split(empirical_root)
     empirical_keys = list(random.split(key_empirical_runs, args.repeats))
+    # Reuse these keys for raw and translation-averaged covariance estimates so
+    # both are computed from the same unpreconditioned ULMC endpoints.
     plain_root = random.fold_in(base_key, 70_000)
     key_warm_plain, key_plain_runs = random.split(plain_root)
     plain_keys = list(random.split(key_plain_runs, args.repeats))
@@ -688,6 +724,7 @@ def make_correlator_figures(
         correlations = result.radial_correlations[method]
         standard_errors = result.radial_standard_errors[method]
         reliable = result.radial_reliable[method]
+        # Show normal-approximation 95% bands only where the IAT is reliable.
         band_width = np.where(
             reliable,
             1.96 * standard_errors,
@@ -854,11 +891,11 @@ def apply_presets(
     apply_quick_configuration(args, explicitly_set)
     apply_gpu_configuration(args, explicitly_set)
     if args.quick and "side" not in explicitly_set:
-        # The legacy quick suite selected d=6: d=8 has D=n and therefore no
-        # full-rank raw empirical covariance.
+        # At d=6 the quick preset can form a full-rank raw covariance; d=8
+        # would have D=n and make that method rank deficient.
         args.side = 6
     if args.gpu and "side" not in explicitly_set:
-        # This matches the legacy GPU opt-in's smallest requested side.
+        # Keep the established moderate-size lattice for the GPU preset.
         args.side = 64
 
 

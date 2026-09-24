@@ -49,6 +49,8 @@ def _experiment_mains() -> dict[str, ExperimentMain]:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """Build the suite selector; scientific options belong to focused modules."""
+
     parser = argparse.ArgumentParser(
         description=(
             "Run the lattice phi4 experiment suite. Use the focused "
@@ -97,6 +99,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _selected_experiments(args: argparse.Namespace) -> tuple[str, ...]:
+    """Resolve suite presets and selections, preserving requested run order."""
+
     if args.quick and args.gpu:
         raise ValueError("--quick and --gpu are mutually exclusive presets.")
     if args.hardness_map:
@@ -117,6 +121,8 @@ def _selected_experiments(args: argparse.Namespace) -> tuple[str, ...]:
 
 
 def main(argv: Sequence[str] | None = None) -> None:
+    """Run selected workflows with the shared preset and output prefix."""
+
     arguments = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
     args = parser.parse_args(arguments)

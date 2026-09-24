@@ -1,4 +1,4 @@
-"""Shared lattice :math:`\phi^4` models, samplers, and condition metrics.
+r"""Shared lattice :math:`\phi^4` models, samplers, and condition metrics.
 
 This module contains the numerical building blocks used by the standalone
 lattice experiments.  It deliberately has no plotting or autocorrelation
@@ -62,7 +62,13 @@ SCALABLE_METHODS = (
 
 @dataclass(frozen=True)
 class LatticeModel:
-    """Periodic lattice phi4 target and its algorithmic tuning scales."""
+    """Periodic square-lattice target and its algorithmic tuning scales.
+
+    Potential and gradient functions accept a flattened, row-major field of
+    length ``side**2``. ``radius`` sets the target's quadratic continuation;
+    ``design_radius`` sets the curvature scale used to tune the samplers.
+    The Laplacian spectrum has shape ``(side, side)`` in unshifted FFT order.
+    """
 
     side: int
     beta: float
@@ -110,7 +116,12 @@ def _truncated_scalar_potential(
     mass: float,
     radius: float,
 ) -> tuple[Array, Array]:
-    """Return ``(w_R, w_R')`` for a finite or infinite target radius."""
+    """Return the on-site potential and derivative at each field value.
+
+    Outside a finite radius, continue the quartic with its second-order
+    Taylor polynomial at the nearest boundary. An infinite radius keeps
+    the genuine quartic everywhere.
+    """
 
     if np.isposinf(radius):
         value = 0.25 * quartic * values**4 + 0.5 * mass * values**2
@@ -141,7 +152,12 @@ def make_lattice_model(
     *,
     design_radius: float | None = None,
 ) -> LatticeModel:
-    """Construct a truncated or genuine-quartic lattice target."""
+    """Construct a truncated or genuine-quartic lattice target.
+
+    A finite target radius gives a global Hessian bound. For an infinite
+    target radius, a finite ``design_radius`` is required for sampler
+    tuning, but it does not bound the target's Hessian or alter its density.
+    """
 
     if side < 2:
         raise ValueError("Lattice side length must be at least two.")
@@ -227,7 +243,11 @@ def make_lattice_model(
 
 
 def validate_lattice_model(model: LatticeModel) -> None:
-    """Run inexpensive analytic-gradient, spectrum, and symmetry checks."""
+    """Check the quartic formula, Laplacian spectrum, and translation symmetry.
+
+    The analytic-gradient discrepancy is also computed, but is not currently
+    enforced as an assertion.
+    """
 
     side = model.side
     test_values = jnp.linspace(
@@ -240,11 +260,6 @@ def validate_lattice_model(model: LatticeModel) -> None:
     automatic = jax.grad(model.potential)(test_values)
     tolerance = 2e-5 if model.dtype == jnp.float32 else 2e-10
     gradient_error = float(jnp.max(jnp.abs(analytic - automatic)))
-    # if gradient_error > tolerance:
-    #     raise AssertionError(
-    #         f"Analytic lattice gradient error {gradient_error:.3e} "
-    #         f"exceeds {tolerance:.1e}."
-    #     )
 
     if not model.is_truncated:
         field = test_values.reshape((side, side))
@@ -298,6 +313,8 @@ def _fourier_cooling_call(
     args: argparse.Namespace,
     num_stages: int | None = None,
 ) -> Array:
+    """Estimate a flattened covariance spectrum with Gaussian cooling."""
+
     if num_stages is None:
         num_stages = args.stages
     return translation_invariant_gaussian_cooling(
@@ -388,7 +405,13 @@ def _make_unpreconditioned_stage_history_call(
     *,
     include_raw_covariances: bool,
 ) -> Callable[[Array], Array | tuple[Array, Array]]:
-    """Return a compiled nested ULMC run sampled after each N-step block."""
+    """Compile one continuous ULMC run, recording each stage's endpoints.
+
+    The returned spectrum history has shape ``(stages + 1, dimension)``;
+    row zero is the initial isotropic spectrum. When requested, the second
+    output contains dense endpoint covariances for stages one onward, with
+    shape ``(stages, dimension, dimension)``.
+    """
 
     dimension = model.dimension
     num_chains = args.chains
@@ -521,16 +544,25 @@ def _fourier_stage_history(
     *,
     use_cooling: bool,
 ) -> np.ndarray:
-    """Return spectra after stages zero through K without rerunning prefixes."""
+    """Return spectra after stages zero through K without rerunning prefixes.
+
+    The first row is the initial isotropic spectrum. Each subsequent row
+    continues from the preceding stage's spectrum and uses the same random
+    key sequence as a single multi-stage cooling call.
+    """
 
     spectrum: Array = (
         jnp.ones(model.dimension, dtype=model.dtype) / model.design_smoothness
     )
     history: list[Array] = [spectrum]
     for stage_index in range(1, args.stages + 1):
+        # The one-stage call splits stage_key internally; retain its parent
+        # key here so its sampling key matches the multi-stage implementation.
         stage_key = key
         key, _ = random.split(key)
         if use_cooling:
+            # A one-stage call raises its cooling factor to power one, so
+            # supply the factor for the current global stage explicitly.
             stage_cooling_gamma = jnp.power(
                 jnp.asarray(args.cooling_gamma, dtype=model.dtype),
                 stage_index,
@@ -572,6 +604,8 @@ def _dense_cooling_call(
     model: LatticeModel,
     args: argparse.Namespace,
 ) -> Array:
+    """Estimate the full covariance matrix with dense Gaussian cooling."""
+
     return gaussian_cooling(
         key,
         model.potential,
@@ -614,6 +648,8 @@ def _apply_spectrum_batch(
     spectrum: Array,
     lattice_shape: tuple[int, int],
 ) -> Array:
+    """Apply one Fourier-diagonal operator to every row of a sample batch."""
+
     return jax.vmap(
         lambda sample: apply_translation_invariant_spectrum(
             sample,
@@ -628,7 +664,12 @@ def reference_samples(
     model: LatticeModel,
     args: argparse.Namespace,
 ) -> Array:
-    """Generate reference endpoints using the known quadratic preconditioner."""
+    """Generate reference endpoints using the known quadratic preconditioner.
+
+    ULMC runs in coordinates whitened by the inverse quadratic Hessian;
+    the returned samples are mapped back to physical lattice coordinates.
+    These finite-run estimates are references, not exact target samples.
+    """
 
     quadratic_spectrum = jnp.asarray(
         1.0 / (model.laplacian_spectrum + model.mass),
@@ -704,6 +745,8 @@ def _safe_spectrum(
     spectrum: np.ndarray,
     relative_floor: float,
 ) -> np.ndarray:
+    """Flatten a finite spectrum and floor it relative to its median."""
+
     spectrum = np.asarray(spectrum, dtype=np.float64).reshape((-1,))
     scale = max(float(np.median(spectrum)), np.finfo(float).tiny)
     floor = relative_floor * scale
@@ -717,6 +760,11 @@ def spectral_relative_condition(
     reference: np.ndarray,
     relative_floor: float,
 ) -> float:
+    """Return max(reference / estimate) divided by its minimum over modes.
+
+    Each spectrum is floored independently before taking modewise ratios.
+    """
+
     estimate = _safe_spectrum(estimate, relative_floor)
     reference = _safe_spectrum(reference, relative_floor)
     ratios = reference / estimate
@@ -728,7 +776,12 @@ def dense_relative_condition(
     reference: np.ndarray,
     relative_ridge: float,
 ) -> float:
-    """Compute the generalized covariance condition number."""
+    """Compute the generalized covariance condition number.
+
+    Whiten the reference covariance by a Cholesky factor of the estimate,
+    then take its largest-to-smallest eigenvalue ratio. The optional ridge
+    is applied only to the estimate before factorization.
+    """
 
     estimate = 0.5 * (estimate + estimate.T)
     dimension = estimate.shape[0]
@@ -755,7 +808,11 @@ def uniform_hessian_condition_bound(
     model: LatticeModel,
     relative_floor: float,
 ) -> float:
-    """Return the reference-free bound from the target Hessian inequalities."""
+    """Return the reference-free bound from the target Hessian inequalities.
+
+    The bound is infinite for a genuine quartic target because its Hessian
+    has no finite global upper bound.
+    """
 
     if not model.is_truncated:
         return np.inf
@@ -808,7 +865,14 @@ def _normalized_preconditioner_operators(
     translation_invariant: bool,
     relative_floor: float,
 ) -> tuple[Callable[[Array], Array], Callable[[Array], Array]]:
-    """Return square-root actions after a scalar smoothness normalization."""
+    """Return coordinate and gradient transforms for a fixed preconditioner.
+
+    Both operators use a square-root factor scaled by the design smoothness
+    of the transformed target. The first maps latent positions to physical
+    coordinates; the second applies the transpose factor to a physical
+    gradient. Fourier spectra and dense covariance matrices share this
+    interface for the trajectory experiments.
+    """
 
     upper_hessian_spectrum = (
         model.laplacian_spectrum

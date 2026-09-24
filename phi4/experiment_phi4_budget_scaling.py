@@ -1,4 +1,4 @@
-"""Chain-and-step budget heatmap for translation-invariant Gaussian cooling.
+r"""Chain-and-step budget heatmap for translation-invariant Gaussian cooling.
 
 This focused experiment fixes one periodic lattice :math:`\phi^4` target and
 varies the number of independent chains ``n`` and ULMC transitions per chain
@@ -59,7 +59,11 @@ QUICK_STEP_COUNTS = (4, 8)
 
 @dataclass
 class BudgetScalingResult:
-    """Preconditioner quality on a Cartesian ``N``-by-``n`` budget grid."""
+    """Preconditioner quality on a Cartesian ``N``-by-``n`` budget grid.
+
+    Metric and timing arrays have axes ``(steps, chains, repeat)``; estimated
+    spectra append a Fourier-mode axis. All cells use one reference spectrum.
+    """
 
     side: int
     chains: np.ndarray
@@ -125,7 +129,11 @@ def _reference_arguments(
     transformed_design_smoothness: float,
     args: argparse.Namespace,
 ) -> argparse.Namespace:
-    """Resolve a stable reference step size and fixed physical run time."""
+    """Resolve automatic reference settings while honoring explicit overrides.
+
+    Without an explicit step count, round up to the requested integration
+    time. An explicit step size is retained even if it triggers a warning.
+    """
 
     reference_args = argparse.Namespace(**vars(args))
     stable_step_size = args.reference_stability_margin / np.sqrt(
@@ -206,6 +214,7 @@ def run_budget_scaling_experiment(
     reference_spectrum = np.asarray(
         sample_power_spectrum(reference, model.lattice_shape)
     )
+    # Compare two reference halves to quantify the reference's own uncertainty.
     midpoint = reference.shape[0] // 2
     first_half_spectrum = np.asarray(
         sample_power_spectrum(reference[:midpoint], model.lattice_shape)
@@ -225,6 +234,7 @@ def run_budget_scaling_experiment(
             cell_args = argparse.Namespace(**vars(args))
             cell_args.chains = int(num_chains)
             cell_args.steps = int(num_steps)
+            # Key by budget values so adding grid cells preserves existing streams.
             cell_key = random.fold_in(
                 random.fold_in(method_key, int(num_chains)),
                 int(num_steps),
@@ -238,6 +248,7 @@ def run_budget_scaling_experiment(
                 f"n={num_chains}, N={num_steps}, K={args.stages}",
                 flush=True,
             )
+            # No warm-up is discarded: the first repeat retains compilation cost.
             for repeat, key in enumerate(repeat_keys):
                 repeat_started = time.perf_counter()
                 spectrum = _fourier_cooling_call(
@@ -430,6 +441,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+    # Target lattice and Cartesian chain/step grid.
     parser.add_argument("--side", type=int, default=100)
     parser.add_argument(
         "--chain-counts",
@@ -451,6 +463,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=argparse.SUPPRESS,
     )
+
+    # Potential, cooling schedule, and method integration settings.
     parser.add_argument("--beta", type=float, default=2.0)
     parser.add_argument("--quartic", type=float, default=0.5)
     parser.add_argument("--mass", type=float, default=0.01)
@@ -469,6 +483,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--step-size", type=float, default=0.01)
     parser.add_argument("--covariance-ridge", type=float, default=0.0)
     parser.add_argument("--metric-floor", type=float, default=1e-10)
+
+    # One independently tuned reference is shared by the entire budget grid.
     parser.add_argument("--reference-chains", type=int, default=4096)
     parser.add_argument(
         "--reference-steps",
@@ -496,6 +512,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=1.5,
         help="Warn when the two reference halves disagree beyond this value.",
     )
+
+    # Precision, reproducibility, output paths, and execution presets.
     parser.add_argument("--dtype", choices=("float32", "float64"), default="float32")
     parser.add_argument("--seed", type=int, default=271828)
     parser.add_argument(
@@ -695,6 +713,8 @@ def print_summary(
 
 
 def main(argv: Sequence[str] | None = None) -> None:
+    """Run the budget grid and save its heatmap, repeats, and metadata."""
+
     arguments = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
     args = parser.parse_args(arguments)

@@ -1,335 +1,98 @@
 # Gaussian cooling
 
-JAX implementations of ULMC, Gaussian cooling, and reproducible Gaussian and
-lattice $\phi^4$ experiments. Preconditioner quality is measured by
+JAX implementations of underdamped Langevin Monte Carlo (ULMC) and Gaussian
+cooling for learning covariance preconditioners. Two experiment groups compare
+cooling with empirical adaptation and unpreconditioned sampling:
 
-```math
-\kappa_{\mathrm{rel}}(\widehat\Sigma,\Sigma)
-=
-\kappa\!\left(
-\widehat\Sigma^{-1/2}\Sigma\widehat\Sigma^{-1/2}
-\right).
-```
+- **Transformed Gaussians**: an exact-covariance benchmark in the project root.
+- **Lattice $\phi^4$**: non-Gaussian experiments on periodic square lattices in
+  [phi4/](phi4/PHI4_EXPERIMENTS.md).
 
-Here $\Sigma$ is an exact or independently estimated target covariance and
-$\widehat\Sigma$ is the learned preconditioner. Smaller is better; the ideal
-value is one. Every figure is saved as a separate vector PDF.
+No datasets are required. Experiments use explicit random seeds and save each
+figure as a separate vector PDF.
 
-## Files
+## Project guide
 
-| File | Purpose |
+| Location | What is implemented |
 | --- | --- |
-| `gaussian_cooling_algs.py` | Reusable ULMC, dense Gaussian cooling, and translation-invariant Gaussian cooling. |
-| `experiment_transformed_gaussian.py` | Exact transformed-Gaussian benchmark. |
-| `phi4/lattice_phi4.py` | Shared lattice model, samplers, reference estimator, and condition metrics. |
-| `phi4/phi4_cli.py`, `phi4/phi4_plotting.py` | Shared command-line, validation, and publication-plot helpers. |
-| `phi4/experiment_phi4_scaling.py` | Preconditioner quality and runtime versus lattice size. |
-| `phi4/experiment_phi4_stage_convergence.py` | Stagewise convergence at selected lattice sizes. |
-| `phi4/experiment_phi4_diagnostics.py` | Post-cooling correlator-IAT and ergodicity diagnostics. |
-| `phi4/experiment_phi4_correlator.py` | Center-site two-point correlators under each preconditioner. |
-| `phi4/experiment_phi4_parameter_sweeps.py` | Controlled $\lambda$, $m$, and $R$ sweeps. |
-| `phi4/experiment_phi4_hardness_map.py` | Fixed-budget $(m,\lambda)$ hardness maps. |
-| `phi4/experiment_phi4_budget_scaling.py` | Chain-by-step budget heatmap for translation-invariant Gaussian cooling. |
-| `phi4/__main__.py` | Convenience launcher for the complete lattice $\phi^4$ suite. |
-| `RUNPOD.md` | Cost-conscious H100 setup and production commands. |
-| `Dockerfile.runpod` | Optional reproducible NVIDIA container. |
+| [gaussian_cooling_algs.py](gaussian_cooling_algs.py) | Standard and transformed ULMC, dense and translation-invariant Gaussian cooling, covariance estimators, and matrix/Fourier utilities. |
+| [experiment_transformed_gaussian.py](experiment_transformed_gaussian.py) | Gaussian benchmark, equal-budget method comparisons, and stage convergence against an exact oracle. |
+| [phi4/](phi4/PHI4_EXPERIMENTS.md) | Lattice model, shared sampling helpers, and seven focused experiments: scaling, stages, diagnostics, correlators, parameter sweeps, hardness maps, and budget scaling. |
+| `figures/`, `results/` | Generated output; ignored by Git. Scripts create output directories as needed. |
 
-No datasets are required.
+## Install and run
 
-## Install
-
-Python 3.10 or newer is required.
+Use Python 3.10 or newer. Run all commands below from this directory.
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-For NVIDIA GPUs, install CUDA-enabled JAX using the
-[official JAX instructions](https://docs.jax.dev/en/latest/installation.html)
-before installing the remaining requirements. JAX automatically uses an
-available GPU. See [RUNPOD.md](RUNPOD.md) for the H100 workflow.
-
-## Quick checks
-
-Run the module commands below from the repository root.
+Start with the reduced experiments:
 
 ```bash
 python experiment_transformed_gaussian.py --quick \
   --output-prefix results/gaussian_quick
-
-python -m phi4 --quick \
-  --output-prefix results/phi4_suite_quick
-
-python -m phi4.experiment_phi4_scaling --quick \
-  --output-prefix results/phi4_scaling_quick
-
-python -m phi4.experiment_phi4_hardness_map --quick \
-  --output-prefix results/phi4_hardness_quick
-
-python -m phi4.experiment_phi4_budget_scaling --quick \
-  --output-prefix results/phi4_budget_quick
+python -m phi4 --quick --output-prefix results/phi4_quick
 ```
 
-## Transformed Gaussian
+`--quick` reduces the experiment size for a smoke test; omit it to use the
+full defaults. `--output-prefix` controls the directory and filename prefix,
+and `--help` lists each entry point's options. Explicit numerical options take
+precedence over presets. The [lattice experiment guide](phi4/PHI4_EXPERIMENTS.md) gives
+commands for each study and describes GPU presets.
 
-The well-conditioned base target is
-$z\sim\mathcal N(0,\Sigma_0)$, where $\kappa(\Sigma_0)=10$ by default.
-Its eigenvectors are Haar-random and its eigenvalues are geometrically spaced
-in $[1,10]$. With $z=B^{1/2}x$, the transformed target is
+## Transformed-Gaussian experiment
 
-```math
-x\sim\mathcal N\!\left(0,B^{-1/2}\Sigma_0B^{-1/2}\right),
-```
+The target starts with $z\sim\mathcal N(0,\Sigma_0)$ and applies the coordinate
+change $z=B^{1/2}x$, giving covariance $B^{-1/2}\Sigma_0B^{-1/2}$. The benchmark
+varies the condition number of $B$ while holding the eigenvectors fixed.
 
-where $B$ has independent Haar eigenvectors and eigenvalues in
-$[1/\kappa(B),1]$. Gaussian cooling, empirical adaptation without cooling,
-and equal-budget unpreconditioned ULMC use the same $nNK$ gradient budget.
+Three methods use the same $nNK$ gradient-evaluation budget, where $n$ is the
+chain count, $N$ the steps per stage, and $K$ the number of stages:
+
+1. Gaussian cooling.
+2. Staged empirical covariance adaptation on the uncooled target.
+3. Unpreconditioned ULMC with $NK$ steps per chain.
 
 ```bash
 python experiment_transformed_gaussian.py \
   --output-prefix figures/transformed_gaussian
+
+# Example with explicit sampling budgets
+python experiment_transformed_gaussian.py \
+  --chains 512 --steps 128 --stages 12 --repeats 12 \
+  --output-prefix figures/gaussian_custom
 ```
 
-| Output suffix | Horizontal axis | Vertical axis |
-| --- | --- | --- |
-| `_preconditioner_quality.pdf` | Transformation condition $\kappa(B)$ | $\kappa_{\mathrm{rel}}$ for all methods |
-| `_stage_convergence.pdf` | Cumulative stage $k$ at the hardest $\kappa(B)$ | $\kappa_{\mathrm{rel}}$, including the exact cooling oracle |
+| Output suffix | What it shows |
+| --- | --- |
+| `_preconditioner_quality.pdf` | Preconditioner quality versus the condition number of $B$. |
+| `_stage_convergence.pdf` | Quality versus cumulative stage at the hardest transformation, including the exact cooled-Gaussian oracle. |
 
-Defaults are dimension 20, $\kappa(B)\in\{1,10,100,10^3,10^4\}$,
-$n=256$, $N=96$, and $K=12$.
+Use `--dimension`, `--base-condition-number`, and `--kappas` to change the
+target; `--chains`, `--steps`, `--stages`, and `--repeats` control sampling.
+See `python experiment_transformed_gaussian.py --help` for all controls.
 
-## Lattice phi4 experiments
+## Reading the results and using the library
 
-The target is defined on a periodic square lattice of side length $d$ and
-ambient dimension $D=d^2$:
+Preconditioner quality is the relative condition number
 
 ```math
-U(\phi)
-=
-\frac12\phi^\mathsf T\Delta_\beta\phi
-+\sum_x u_R(\phi_x).
+\kappa_{\mathrm{rel}}(\widehat\Sigma,\Sigma)
+=\kappa\!\left(\widehat\Sigma^{-1/2}\Sigma\widehat\Sigma^{-1/2}\right).
 ```
 
-Inside $[-R,R]$, $u_R(z)=\lambda z^4/4+mz^2/2$; outside, the truncated
-target uses its quadratic continuation. For finite $R$,
+Here $\widehat\Sigma$ is the learned preconditioner and $\Sigma$ is the target
+covariance. Smaller is better; the ideal value is one. The Gaussian benchmark
+uses an analytic covariance; the lattice studies use independent reference
+samples, so their quality estimates also have Monte Carlo error.
 
-```math
-\mu=m,
-\qquad
-L=\lambda_{\max}(\Delta_\beta)+m+3\lambda R^2,
-\qquad
-\kappa_H=L/\mu.
-```
-
-The non-Gaussian covariance is not analytic. Each relative-condition estimate
-therefore uses independent reference endpoints sampled after preconditioning
-by $(\Delta_\beta+mI)^{-1}$, followed by translation averaging in Fourier
-space.
-
-The four primary methods are translation-invariant Gaussian cooling,
-translation-invariant empirical preconditioning without cooling, translation
-averaging of equal-budget unpreconditioned ULMC endpoints, and the raw full
-empirical covariance of those endpoints where $n>D$ and the matrix is small
-enough to form. Dense Gaussian cooling is an ancillary small-$D$ comparison.
-
-### Focused entry points
-
-Each experiment can be run independently with only its relevant options.
-
-| Module file | Experiment | Main outputs |
-| --- | --- | --- |
-| `phi4/experiment_phi4_scaling.py` | Quality and post-JIT runtime versus $d$ | `_preconditioner_quality.pdf`, `_covariance_estimation_cost.pdf`, and dense ancillary PDFs |
-| `phi4/experiment_phi4_stage_convergence.py` | Equal-budget convergence versus cumulative stage $k$ | `_stage_comparison_d{d}.pdf` |
-| `phi4/experiment_phi4_diagnostics.py` | Correlator IATs and final-half mean diagnostics after cooling | `_two_point_iat_d{d}.pdf`, `_ergodicity_site_mean_z_scores_d{d}.pdf` |
-| `phi4/experiment_phi4_correlator.py` | Center-site correlator decay under each feasible preconditioner | `_two_point_correlator_decay_d{d}.pdf` |
-| `phi4/experiment_phi4_parameter_sweeps.py` | One-factor $\lambda$, $m$, and $R$ comparisons | `_parameter_sweep_lambda.pdf`, `_parameter_sweep_mass.pdf`, `_parameter_sweep_radius.pdf`, `_truncation_to_quartic_covariance.pdf` |
-| `phi4/experiment_phi4_hardness_map.py` | Fixed-budget map over $(m,\lambda)$ at $R=4$, $\beta=2$ | `_hardness_absolute_d{d}.pdf`, `_hardness_adaptive_gain_d{d}.pdf`, `_hardness_map_data.npz` |
-| `phi4/experiment_phi4_budget_scaling.py` | Cartesian comparison of chain count $n$ and steps per chain and stage $N$ at fixed $d=100$ | `_budget_heatmap_d100.pdf`, `_budget_grid_d100_data.npz` |
-
-Default runs:
-
-```bash
-python -m phi4.experiment_phi4_scaling \
-  --output-prefix figures/phi4_scaling
-
-python -m phi4.experiment_phi4_stage_convergence \
-  --output-prefix figures/phi4_stages
-
-python -m phi4.experiment_phi4_diagnostics \
-  --output-prefix figures/phi4_diagnostics
-
-python -m phi4.experiment_phi4_correlator \
-  --output-prefix figures/phi4_correlator
-
-python -m phi4.experiment_phi4_parameter_sweeps \
-  --output-prefix figures/phi4_parameter_sweeps
-
-python -m phi4.experiment_phi4_hardness_map \
-  --output-prefix figures/phi4_hardness
-
-python -m phi4.experiment_phi4_budget_scaling --gpu \
-  --output-prefix figures/phi4_budget_scaling
-```
-
-Use `python -m phi4.MODULE --help` for focused scientific controls. The suite
-launcher intentionally accepts only suite selection, quick/GPU presets, and
-an output prefix; it runs the complete ordinary suite with:
-
-```bash
-python -m phi4 \
-  --output-prefix figures/truncated_phi4
-```
-
-The ordinary target defaults are $\beta=2$, $\lambda=0.5$, $m=0.25$, and
-$R=2$. Method defaults are $n=512$, $N=64$, and three repeats. Scaling and
-stage convergence use $K=8$; parameter sweeps use $K=12$.
-
-### Sampling diagnostics and correlators
-
-The diagnostic experiment learns a translation-invariant Gaussian-cooling
-preconditioner and estimates the IAT of
-
-```math
-g_x(t)=\delta\phi_t(0)\,\delta\phi_t(x)
-```
-
-for every lattice site $x$. Its ergodicity map uses the mean of the final half
-of the retained chain and an IAT-adjusted Monte Carlo standard error. Gray
-sites do not have a sufficiently long chain for a reliable standardized mean.
-
-The separate correlator experiment uses
-$c=(\lfloor d/2\rfloor,\lfloor d/2\rfloor)$ and estimates the connected
-correlator
-
-```math
-C(c,x)
-=
-\mathbb E[(\phi(c)-\mathbb E\phi(c))(\phi(x)-\mathbb E\phi(x))].
-```
-
-It averages over exact toroidal-distance shells and shows IAT-adjusted 95%
-uncertainty bands where reliable. At equilibrium, $\phi\mapsto-\phi$ symmetry
-makes the connected and ordinary correlators equal. All method curves target
-the same observable; disagreement can indicate burn-in, Monte Carlo error, or
-finite-step ULMC bias. Repeat publication runs with longer trajectories and a
-smaller step size. The uncertainty bands condition on the selected learned
-preconditioner and do not include learning variability.
-
-### Genuine quartic target
-
-`--radius inf` removes the truncation. The quartic Hessian is then unbounded,
-so `--cooling-design-radius` is only an operational stage-zero and step-size
-scale; it does not change the target or provide a global smoothness bound.
-
-```bash
-python -m phi4.experiment_phi4_scaling --quick --radius inf \
-  --cooling-design-radius 2 \
-  --output-prefix figures/phi4_genuine_quartic
-```
-
-Check important runs with a larger design radius and smaller step size.
-
-### Budget scaling, parameter sweeps, and hardness map
-
-The budget-scaling experiment fixes $d=100$, $\beta=2$, $\lambda=0.5$,
-$m=0.01$, $R=4$, and $K=12$. It evaluates translation-invariant Gaussian
-cooling on all 25 pairs in the Cartesian grid
-
-```math
-n\in\{64,128,256,512,1024\},
-\qquad
-N\in\{32,64,128,256,512\}.
-```
-
-The heatmap's horizontal axis is $n$, the number of independent chains at
-each cooling stage. Its vertical axis is $N$, the number of ULMC transitions
-per chain at each stage. Each cell's color is the median relative condition
-number over five repeats. The color normalization is logarithmic; smaller
-values, approaching one, indicate a better preconditioner. Because the full
-grid varies one coordinate while holding the other fixed, it reveals the
-separate empirical effects of additional chains and longer chains rather than
-only their joint effect along a diagonal path. One shared reference uses 4,096
-independently preconditioned chains and an automatically stability-limited
-step size. The NPZ preserves every learned spectrum, repeat-level relative
-condition number, runtime, grid coordinate, and reference setting. Use
-`--chain-counts C1,C2,...` and `--step-counts S1,S2,...` to change either
-axis. Because the default run is accelerator-scale, it is not part of the
-ordinary `python -m phi4` suite; invoke it directly or select it with
-`python -m phi4 --only budget`.
-
-The parameter-sweep defaults use side 10. They vary
-$\lambda\in\{0.1,0.5,2\}$ at $m=0.05,R=2$,
-$m\in\{0.01,0.05,0.25\}$ at $\lambda=0.5,R=2$, and
-$R\in\{0.5,2,4,\infty\}$ at $\lambda=0.5,m=0.05$, with common
-$R_{\mathrm{design}}=4$.
-
-The hardness map fixes $R=4$ and $\beta=2$. Its horizontal axis is mass $m$,
-its vertical axis is quartic coupling $\lambda$, and both are logarithmic. For
-the default even sides,
-
-```math
-\kappa_H=1+\frac{16+48\lambda}{m}.
-```
-
-Every cell uses the same practitioner budget, by default $n=512$, $N=128$,
-and $K=12$. The three scalable methods receive equal $nNK$ gradient budgets;
-the raw full covariance is omitted. Absolute maps show median
-$\log_{10}\kappa_{\mathrm{rel}}$. Gain maps show
-$\log_{10}(\kappa_{\mathrm{baseline}}/\kappa_{\mathrm{method}})$, using
-translation-averaged ULMC as the baseline. The NPZ file preserves all repeats,
-axes, budgets, and reference settings. Use at least three repeats and increase
-the reference budget for publication results.
-
-### GPU scaling
-
-Run the large-lattice scaling and stage experiments independently, and run the
-fixed-$d$ budget study as a separate job:
-
-```bash
-python -m phi4.experiment_phi4_scaling --gpu \
-  --output-prefix figures/phi4_gpu_scaling
-
-python -m phi4.experiment_phi4_stage_convergence --gpu \
-  --output-prefix figures/phi4_gpu_stages
-
-python -m phi4.experiment_phi4_budget_scaling --gpu \
-  --output-prefix figures/phi4_budget_scaling_d100
-```
-
-The scaling preset uses sides 64, 128, 256, 512, and 1024 with float32,
-$n=64$, $N=32$, $K=8$, and one repeat. The stage preset uses sides 512 and
-1024. Both require a visible JAX GPU and retain only scalable Fourier methods
-at these ranks. The suite-launcher alternative runs both presets in one
-command:
-
-```bash
-python -m phi4 --gpu \
-  --output-prefix figures/phi4_gpu_suite
-```
-
-The budget-scaling and hardness-map `--gpu` flags require a visible GPU but do
-not alter their scientific settings. The budget heatmap evaluates 25 budget
-pairs at five repeats per pair and is intended for a large-memory
-accelerator; use `--quick` for a local smoke test.
-
-## Library use and reproducibility
-
-`gaussian_cooling_algs.py` exports `ulmc`, `transformed_ulmc`,
-`gaussian_cooling`, `translation_invariant_gaussian_cooling`, covariance
-estimators, Fourier operators, and symmetric matrix-square-root utilities.
-`phi4/lattice_phi4.py` supplies the shared periodic target, reference sampler,
-method wrappers, and condition metrics used by every focused lattice module.
-The experiment modules contain only their own run, result, plot, summary, and
-CLI logic; `phi4/phi4_cli.py` and `phi4/phi4_plotting.py` centralize reusable
-interface and presentation helpers.
-
-Samplers return independent-chain endpoints rather than trajectories.
-`sample_covariance` uses the biased $1/n$ normalization. At large lattice
-sizes, retain Fourier spectra rather than materializing dense covariances.
-All experiment modules use explicit seeds. Small numerical differences can
-occur across JAX versions and hardware.
-
-Add the copyright holder's chosen license and paper citation before release.
+The reusable samplers in `gaussian_cooling_algs.py` return independent-chain
+endpoints. `sample_covariance` uses the biased $1/n$ normalization. For large
+lattices, retain Fourier spectra instead of forming dense covariance matrices.
+The library leaves JAX precision configuration to the caller; experiment
+scripts expose `--dtype` and `--seed`. Results can differ slightly across JAX
+versions and hardware.

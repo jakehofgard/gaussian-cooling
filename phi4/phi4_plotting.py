@@ -41,6 +41,8 @@ PLOT_LABELS = {
 
 
 def _configure_plot_style() -> None:
+    """Apply the common typography and line styling to subsequent figures."""
+
     plt.rcParams.update(
         {
             "font.family": "serif",
@@ -66,11 +68,6 @@ def _phi4_parameter_subtitle(args: argparse.Namespace) -> str:
     """Return concise target and method-budget metadata for phi4 plots."""
 
     radius_text = r"\infty" if np.isposinf(args.radius) else f"{args.radius:g}"
-    # design_text = (
-    #     rf",\ R_{{\rm design}}={args.cooling_design_radius:g}"
-    #     if np.isposinf(args.radius)
-    #     else ""
-    # )
     design_text = ""
     return (
         rf"$\beta={args.beta:g},\ \lambda={args.quartic:g},\ "
@@ -90,6 +87,12 @@ def _plot_median_iqr(
     linestyle: str,
     label: str,
 ) -> None:
+    """Plot rowwise medians and interquartile bands across repeated runs.
+
+    ``values`` has one row per x coordinate and one column per repeat.
+    Rows without finite observations are omitted.
+    """
+
     valid_rows = np.any(np.isfinite(values), axis=1)
     if not np.any(valid_rows):
         return
@@ -153,7 +156,11 @@ def save_publication_figures(
     figures: dict[str, plt.Figure],
     output: Path,
 ) -> dict[str, Path]:
-    """Save every plot as a separate vector PDF."""
+    """Save each plot as ``<output_stem>_<plot_name>.pdf`` and return its path.
+
+    Any suffix on ``output`` is replaced; parent directories are created
+    as needed. Figures remain open for the caller to manage.
+    """
 
     output = output.expanduser().resolve()
     stem = output.with_suffix("") if output.suffix else output

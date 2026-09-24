@@ -69,7 +69,11 @@ from matplotlib.ticker import NullFormatter
 
 @dataclass
 class ScalingResult:
-    """Quality and post-compilation timings across lattice sides."""
+    """Quality and post-compilation timings across lattice sides.
+
+    Metric and timing arrays have axes ``(side, repeat)``. Skipped dense
+    estimates remain NaN, with explanations indexed by lattice side.
+    """
 
     sides: np.ndarray
     relative_conditions: dict[str, np.ndarray]
@@ -82,7 +86,12 @@ class ScalingResult:
 
 
 def run_scaling_experiment(args: argparse.Namespace) -> ScalingResult:
-    """Run only the lattice-size quality and timing experiment."""
+    """Compare final covariance estimates against one reference per side.
+
+    Each method is compiled and warmed up before timing retained repeats.
+    Dense estimates are included only when the chain count and side cutoff
+    permit a full-rank covariance of manageable size.
+    """
 
     dtype = jnp.float64 if args.dtype == "float64" else jnp.float32
     sides = np.asarray(args.sides, dtype=int)
@@ -112,6 +121,7 @@ def run_scaling_experiment(args: argparse.Namespace) -> ScalingResult:
             ),
         )
         validate_lattice_model(model)
+        # Separate warm-up, retained-run, and reference random streams.
         base_key = random.fold_in(root_key, side_index)
         fourier_keys = list(
             random.split(
@@ -154,6 +164,7 @@ def run_scaling_experiment(args: argparse.Namespace) -> ScalingResult:
         )
         runtimes[TRANSLATION_AVERAGED_ULMC][side_index] = elapsed
 
+        # A centered empirical covariance has rank at most chains - 1.
         raw_reason: str | None = None
         if args.chains <= model.dimension:
             raw_reason = f"n={args.chains} <= D={model.dimension} (rank deficient)"
@@ -185,6 +196,7 @@ def run_scaling_experiment(args: argparse.Namespace) -> ScalingResult:
         )
         reference_covariance: np.ndarray | None = None
         if raw_reason is None or dense_reason is None:
+            # Materialize the D-by-D reference only for dense comparisons.
             reference_covariance = np.asarray(
                 translation_invariant_covariance(
                     jnp.asarray(reference_spectrum, dtype=dtype),
@@ -255,7 +267,7 @@ def make_scaling_figures(
     result: ScalingResult,
     args: argparse.Namespace,
 ) -> dict[str, plt.Figure]:
-    """Create the four standalone scaling figures."""
+    """Create quality/cost figures and, when available, two dense comparisons."""
 
     _configure_plot_style()
     figures: dict[str, plt.Figure] = {}
@@ -396,6 +408,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Compare phi4 preconditioner quality and cost across lattice sizes.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+    # Target lattice and potential.
     parser.add_argument("--sides", type=_parse_sides, default=[5, 10, 20, 50, 100])
     parser.add_argument("--beta", type=float, default=2.0)
     parser.add_argument(
@@ -409,6 +422,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Use inf for the genuine quartic target.",
     )
     parser.add_argument("--cooling-design-radius", type=float, default=4.0)
+
+    # Compared-method budgets, integration settings, and quality metrics.
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--chains", type=int, default=512)
     parser.add_argument("--steps", type=int, default=256)
@@ -421,6 +436,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--metric-floor", type=float, default=1e-10)
     parser.add_argument("--metric-ridge", type=float, default=0.0)
     parser.add_argument("--dense-max-side", type=int, default=20)
+
+    # Independent reference sampler and execution/output settings.
     parser.add_argument("--reference-chains", type=int, default=512)
     parser.add_argument("--reference-steps", type=int, default=256)
     parser.add_argument("--reference-step-size", type=float, default=0.01)
@@ -576,6 +593,8 @@ def print_summary(result: ScalingResult) -> None:
 
 
 def main(argv: Sequence[str] | None = None) -> None:
+    """Parse settings, run the size comparison, and save its PDF panels."""
+
     arguments = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
     args = parser.parse_args(arguments)

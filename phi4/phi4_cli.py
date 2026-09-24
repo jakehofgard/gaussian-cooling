@@ -1,4 +1,9 @@
-"""Composable command-line helpers for lattice phi4 experiments."""
+"""Shared arguments, presets, and validation for lattice phi4 experiments.
+
+Focused experiment modules compose these argument groups and add their own
+options. Presets only replace options absent from the command line, so an
+explicit budget or target parameter takes precedence over a preset.
+"""
 
 from __future__ import annotations
 
@@ -13,6 +18,8 @@ import numpy as np
 
 
 def _parse_sides(value: str) -> list[int]:
+    """Parse distinct lattice side lengths and return them in sorted order."""
+
     sides = [int(part.strip()) for part in value.split(",") if part.strip()]
     if not sides or any(side < 2 for side in sides):
         raise argparse.ArgumentTypeError(
@@ -198,7 +205,7 @@ def add_reference_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--reference-chains",
         type=int,
-        default=256,
+        default=512,
         help="Independent chains used for each reference estimate.",
     )
     parser.add_argument(
@@ -258,7 +265,11 @@ def _explicit_cli_destinations(
     parser: argparse.ArgumentParser,
     arguments: Sequence[str],
 ) -> set[str]:
-    """Return parser destinations explicitly present on the command line."""
+    """Return destinations supplied with an option name or ``--option=value``.
+
+    Preset application uses these destinations to preserve explicit values,
+    including values supplied through an option's alias.
+    """
 
     destinations: set[str] = set()
     for action in parser._actions:
@@ -276,7 +287,11 @@ def _apply_present_preset_values(
     values: dict[str, object],
     explicit_destinations: set[str],
 ) -> None:
-    """Set non-explicit preset values that exist on a focused parser."""
+    """Apply preset defaults only to options exposed by this experiment.
+
+    Some focused parsers omit reference or trajectory options, so absent
+    attributes are skipped along with explicitly supplied values.
+    """
 
     for destination, value in values.items():
         if destination not in explicit_destinations and hasattr(args, destination):
@@ -327,7 +342,7 @@ def apply_gpu_configuration(
         "steps": 128,
         "stages": 12,
         "reference_chains": 512,
-        "reference_steps": 128,
+        "reference_steps": 256,
         "dense_max_side": 0,
         "dtype": "float32",
     }

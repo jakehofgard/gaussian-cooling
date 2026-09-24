@@ -52,12 +52,19 @@ def _floating_array(x: Array) -> Array:
     return x
 
 
+# ULMC transitions and independent-chain samplers.
+
+
 def ulmc_coefficients(
     friction_gamma: float,
     step_size_h: float,
     dtype: jnp.dtype,
 ) -> tuple[Array, Array, Array, Array]:
-    """Return the exact transition coefficients and noise Cholesky factor.
+    """Return the drift coefficients and joint position/momentum noise factor.
+
+    Outputs are momentum decay, position coefficient, gradient coefficient,
+    and a ``(2, 2)`` Cholesky factor. These integrate the ULMC transition with
+    the potential gradient held fixed over one step.
 
     Direct evaluation of the position-noise variance subtracts three nearly
     equal terms when ``friction_gamma * step_size_h`` is small.  The formulas
@@ -254,6 +261,7 @@ def _ulmc_impl(
         positions, momenta, key = carry
         key, noise_key = random.split(key)
 
+        # The final axis couples position and momentum noise at each coordinate.
         standard_noise = random.normal(
             noise_key,
             shape=(num_chains, dimension, 2),
@@ -339,7 +347,12 @@ def _transformed_ulmc_impl(
     num_chains: int,
     noise_cholesky: Array | None,
 ) -> Array:
-    """Unjitted transformed-ULMC body with ``A = C @ C.T``."""
+    """Run ULMC in physical coordinates with ``A = C @ C.T``.
+
+    Initialization and noise are drawn in the factor's latent dimension,
+    then mapped to physical coordinates. Gradients are multiplied by ``A``
+    through two factor products, avoiding a separate dense matrix.
+    """
 
     del potential_fn
 
@@ -350,9 +363,7 @@ def _transformed_ulmc_impl(
     if factor_C.ndim != 2:
         raise ValueError("factor_C must be a two-dimensional array")
     if factor_C.shape[0] != minimizer.shape[0]:
-        raise ValueError(
-            "factor_C must have one row per coordinate of minimizer"
-        )
+        raise ValueError("factor_C must have one row per coordinate of minimizer")
     if factor_C.shape[1] < factor_C.shape[0]:
         raise ValueError(
             "factor_C must have at least d columns to have full row rank"
@@ -489,6 +500,9 @@ def transformed_ulmc(
     )
 
 
+# Covariance estimators and Fourier representations.
+
+
 def sample_mean(samples: Array) -> Array:
     """Return the sample mean of an ``(n, d)`` array."""
 
@@ -623,6 +637,9 @@ def translation_invariant_covariance(
     return 0.5 * (covariance + covariance.T)
 
 
+# Dense and Fourier Gaussian-cooling recurrences.
+
+
 def symmetric_matrix_sqrt(
     A: Array,
     regularize: bool = False,
@@ -630,8 +647,9 @@ def symmetric_matrix_sqrt(
 ) -> tuple[Array, Array]:
     """Return the symmetric square root and inverse square root of ``A``.
 
-    If ``regularize`` is true, ``epsilon * I`` is added before the symmetric
-    eigendecomposition.
+    If ``regularize`` is true, shift the eigenvalues by ``epsilon``. This is
+    equivalent to adding ``epsilon * I`` before factorization, while retaining
+    small ridges that could otherwise round away in the matrix entries.
     """
 
     A = _floating_array(A)
@@ -718,20 +736,17 @@ def gaussian_cooling(
     )
 
     if initial_preconditioner is None:
-        initial_covariance = (
-            jnp.eye(dimension, dtype=dtype) / smoothness_L
-        )
+        initial_covariance = jnp.eye(dimension, dtype=dtype) / smoothness_L
     else:
         initial_covariance = jnp.asarray(
             initial_preconditioner,
             dtype=dtype,
         )
-        initial_covariance = 0.5 * (
-            initial_covariance + initial_covariance.T
-        )
+        initial_covariance = 0.5 * (initial_covariance + initial_covariance.T)
 
     def cooling_stage(carry, stage_index):
         covariance_previous, key = carry
+        # Whiten with the previous covariance before sampling the next target.
         covariance_sqrt, covariance_inv_sqrt = symmetric_matrix_sqrt(
             covariance_previous,
             regularize=covariance_regularization > 0,
@@ -772,12 +787,9 @@ def gaussian_cooling(
             num_chains,
         )
 
+        # Lift the endpoint covariance back to the original coordinates.
         preconditioned_covariance = sample_covariance(samples)
-        covariance = (
-            covariance_sqrt
-            @ preconditioned_covariance
-            @ covariance_sqrt
-        )
+        covariance = covariance_sqrt @ preconditioned_covariance @ covariance_sqrt
         covariance = 0.5 * (covariance + covariance.T)
         return (covariance, key), None
 
@@ -855,9 +867,7 @@ def translation_invariant_gaussian_cooling(
     )
 
     if initial_spectrum is None:
-        spectrum_initial = (
-            jnp.ones((dimension,), dtype=dtype) / smoothness_L
-        )
+        spectrum_initial = jnp.ones((dimension,), dtype=dtype) / smoothness_L
     else:
         spectrum_initial = jnp.asarray(
             initial_spectrum,
@@ -924,6 +934,7 @@ def translation_invariant_gaussian_cooling(
             num_chains,
         )
         stage_spectrum = sample_power_spectrum(samples, shape)
+        # The dense covariance lift becomes elementwise multiplication in Fourier.
         spectrum = effective_spectrum * stage_spectrum
         return (spectrum, key), None
 

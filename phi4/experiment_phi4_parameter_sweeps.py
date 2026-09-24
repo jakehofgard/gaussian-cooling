@@ -1,4 +1,4 @@
-"""Controlled parameter sweeps for periodic lattice :math:`\phi^4` targets.
+r"""Controlled parameter sweeps for periodic lattice :math:`\phi^4` targets.
 
 This focused experiment compares four equal-budget covariance-preconditioning
 methods while varying one physical parameter at a time: the quartic coupling
@@ -72,7 +72,11 @@ from .phi4_plotting import (
 
 @dataclass
 class ParameterSweepResult:
-    """Controlled one-parameter sweeps for the four primary methods."""
+    """Controlled one-parameter sweeps for the four primary methods.
+
+    ``relative_conditions[sweep][method]`` has axes ``(value, repeat)``.
+    Other dictionaries hold one reference or target diagnostic per value.
+    """
 
     sweep_side: int
     values: dict[str, np.ndarray]
@@ -108,7 +112,11 @@ def _parameter_reference_arguments(
     model: LatticeModel,
     args: argparse.Namespace,
 ) -> argparse.Namespace:
-    """Return per-target reference settings with a fixed stability margin."""
+    """Limit the reference step size while preserving its integration time.
+
+    The step count is rounded up so each target is sampled for at least
+    ``reference_time``, even when its curvature requires smaller steps.
+    """
 
     reference_args = argparse.Namespace(**vars(args))
     transformed_design_smoothness = (
@@ -140,6 +148,7 @@ def _evaluate_primary_methods(
             "empirical covariance is nonsingular."
         )
 
+    # Adaptive methods share keys; plain ULMC and the reference use separate streams.
     adaptive_root, plain_root, reference_key = random.split(key, 3)
     adaptive_warm_key, adaptive_run_root = random.split(adaptive_root)
     adaptive_keys = list(random.split(adaptive_run_root, args.repeats))
@@ -167,6 +176,7 @@ def _evaluate_primary_methods(
     def plain_call(run_key: jax.Array) -> tuple[jax.Array, jax.Array]:
         return _unpreconditioned_estimators_call(run_key, model, args)
 
+    # Both plain-ULMC estimators use the same sampled endpoints.
     jax.block_until_ready(plain_call(plain_warm_key))
     translation_averaged_spectra: list[np.ndarray] = []
     raw_covariances: list[np.ndarray] = []
@@ -307,6 +317,7 @@ def run_parameter_sweeps(
     }
 
     root_key = random.fold_in(random.PRNGKey(args.seed), 300_000)
+    # Reuse targets appearing in multiple sweeps, including their reference samples.
     cache: dict[
         tuple[float, float, float, float],
         _PrimaryMethodEvaluation,
@@ -317,9 +328,12 @@ def run_parameter_sweeps(
         sweep_name: str,
         value: float,
     ) -> tuple[float, float, float, float]:
+        """Return the target and design radius with only one parameter varied."""
+
         quartic = value if sweep_name == "quartic" else args.parameter_sweep_quartic
         mass = value if sweep_name == "mass" else args.parameter_sweep_mass
         radius = value if sweep_name == "radius" else args.parameter_sweep_radius
+        # The radius sweep uses one curvature scale, including its R=infinity target.
         design_radius = args.cooling_design_radius if sweep_name == "radius" else radius
         return (
             float(quartic),
@@ -364,19 +378,19 @@ def run_parameter_sweeps(
                     evaluation.relative_conditions[method]
                 )
             hessian_bounds[sweep_name][value_index] = evaluation.hessian_condition_bound
-            reference_conditions[sweep_name][
-                value_index
-            ] = evaluation.reference_condition
-            continuation_fractions[sweep_name][
-                value_index
-            ] = evaluation.continuation_fraction
-            design_exceedance_fractions[sweep_name][
-                value_index
-            ] = evaluation.design_exceedance_fraction
+            reference_conditions[sweep_name][value_index] = (
+                evaluation.reference_condition
+            )
+            continuation_fractions[sweep_name][value_index] = (
+                evaluation.continuation_fraction
+            )
+            design_exceedance_fractions[sweep_name][value_index] = (
+                evaluation.design_exceedance_fraction
+            )
             reference_spectra[sweep_name][value_index] = evaluation.reference_spectrum
-            reference_step_sizes[sweep_name][
-                value_index
-            ] = evaluation.reference_step_size
+            reference_step_sizes[sweep_name][value_index] = (
+                evaluation.reference_step_size
+            )
             reference_steps[sweep_name][value_index] = evaluation.reference_steps
 
     radius_values = sweep_specs["radius"]
@@ -387,6 +401,7 @@ def run_parameter_sweeps(
     )
     quartic_indices = np.flatnonzero(np.isposinf(radius_values))
     if quartic_indices.size:
+        # Compare target covariances themselves, separately from estimator quality.
         quartic_spectrum = reference_spectra["radius"][int(quartic_indices[0])]
         assert quartic_spectrum is not None
         for value_index, finite_spectrum in enumerate(reference_spectra["radius"]):
@@ -472,6 +487,7 @@ def make_parameter_sweep_figures(
     for sweep_name, values in result.values.items():
         x_label, title, figure_name = plot_metadata[sweep_name]
         is_radius_sweep = sweep_name == "radius"
+        # Treat radii as categories so the genuine-quartic endpoint fits on the axis.
         plot_values = np.arange(len(values), dtype=float) if is_radius_sweep else values
         figure, ax = plt.subplots(
             figsize=(6.5, 4.9),
@@ -650,6 +666,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+    # Lattice, sweep axes, and values held fixed in each one-parameter sweep.
     parser.add_argument(
         "--side",
         "--parameter-sweep-side",
@@ -720,6 +737,8 @@ def build_parser() -> argparse.ArgumentParser:
             "in the radius sweep."
         ),
     )
+
+    # Equal method budgets and the independently tuned reference sampler.
     parser.add_argument(
         "--repeats",
         type=int,
@@ -779,6 +798,8 @@ def build_parser() -> argparse.ArgumentParser:
             "--step-size before applying the stability margin."
         ),
     )
+
+    # Integration settings, numerical metrics, and output controls.
     parser.add_argument(
         "--cooling-gamma",
         type=float,
@@ -859,7 +880,7 @@ def apply_quick_configuration(
     args: argparse.Namespace,
     explicit_destinations: set[str] | None = None,
 ) -> None:
-    """Apply the former suite's parameter-sweep quick preset."""
+    """Reduce the sweep and sampling budgets, preserving explicit overrides."""
 
     if not args.quick:
         return

@@ -72,7 +72,13 @@ Array = jax.Array
 
 @dataclass
 class SiteDiagnostics:
-    """Bounded-memory diagnostics derived from one retained trajectory."""
+    """Mixing and symmetry diagnostics from one retained trajectory.
+
+    Correlator arrays are flat, with one entry per site in row-major order.
+    Site-field and site-mean arrays have lattice shape ``(side, side)`` and
+    use only the final half of the retained trajectory. Reliability masks
+    indicate whether the corresponding chain-length-to-IAT criterion is met.
+    """
 
     distances: np.ndarray
     covariance_row: np.ndarray
@@ -207,6 +213,8 @@ def _write_preconditioned_site_series(
         *,
         emit_fields: bool,
     ) -> tuple[tuple[Array, Array, Array, Array], Array | None]:
+        """Cache scans by length and whether they retain physical fields."""
+
         runner_key = (length, emit_fields)
         if runner_key not in runners:
             transition = sampling_transition if emit_fields else burnin_transition
@@ -228,6 +236,7 @@ def _write_preconditioned_site_series(
         state, _ = run_chunk(state, length, emit_fields=False)
         remaining_burnin -= length
 
+    # Accumulate the final-half means independently of the later disk analysis.
     final_half_start = args.trajectory_samples // 2
     final_half_sum = np.zeros(model.dimension, dtype=np.float64)
     sample_start = 0
@@ -263,7 +272,11 @@ def _estimate_integrated_times(
     observables: np.ndarray,
     iat_tolerance: int,
 ) -> np.ndarray:
-    """Estimate one IAT per observable, retaining short-chain estimates."""
+    """Estimate IATs for an array shaped ``(samples, observables)``.
+
+    Keep estimates even when emcee reports a chain that is too short. The
+    caller separately marks reliability using the requested tolerance.
+    """
 
     if integrated_time is None:
         raise RuntimeError(
@@ -298,7 +311,12 @@ def _analyze_site_store(
     iat_tolerance: int,
     iat_batch_size: int,
 ) -> SiteDiagnostics:
-    """Analyze correlator mixing and final-half site-mean uncertainty."""
+    """Analyze a site-major trajectory in batches of lattice sites.
+
+    Connected origin-site products use all retained samples. Site means and
+    their IAT-adjusted uncertainties use only the final half, providing a
+    separate check against the target's zero mean under field-sign symmetry.
+    """
 
     if integrated_time is None:
         raise RuntimeError(
@@ -309,7 +327,7 @@ def _analyze_site_store(
     dimension = side * side
     if store.shape != (dimension, num_samples):
         raise ValueError(
-            "The site-series store must have shape " "(side**2, trajectory_samples)."
+            "The site-series store must have shape (side**2, trajectory_samples)."
         )
     final_half_start = num_samples // 2
     final_half_sample_count = num_samples - final_half_start
@@ -355,6 +373,7 @@ def _analyze_site_store(
         )
         site_field_autocorrelation_times[start:stop] = site_field_autocorrelation_batch
 
+        # Center each field before forming the connected two-point observable.
         centered_sites = site_series - np.mean(site_series, axis=1, keepdims=True)
         correlators = centered_origin[None, :] * centered_sites
         covariance_row[start:stop] = np.mean(correlators, axis=1)
@@ -377,6 +396,7 @@ def _analyze_site_store(
     site_field_reliable = valid_site_estimates & (
         final_half_sample_count >= iat_tolerance * site_field_autocorrelation_times
     )
+    # Keep finite short-chain estimates, but expose their reliability separately.
     standard_errors = np.full(dimension, np.nan, dtype=float)
     effective_sample_sizes = np.full(dimension, np.nan, dtype=float)
     z_scores = np.full(dimension, np.nan, dtype=float)
@@ -405,13 +425,9 @@ def _analyze_site_store(
         site_field_autocorrelation_times=(
             site_field_autocorrelation_times.reshape(lattice_shape)
         ),
-        site_field_autocorrelation_reliable=(
-            site_field_reliable.reshape(lattice_shape)
-        ),
+        site_field_autocorrelation_reliable=site_field_reliable.reshape(lattice_shape),
         site_mean_standard_errors=standard_errors.reshape(lattice_shape),
-        site_mean_effective_sample_sizes=(
-            effective_sample_sizes.reshape(lattice_shape)
-        ),
+        site_mean_effective_sample_sizes=effective_sample_sizes.reshape(lattice_shape),
         site_mean_z_scores=z_scores.reshape(lattice_shape),
         final_half_sample_count=final_half_sample_count,
     )
@@ -423,7 +439,12 @@ def run_preconditioned_diagnostics(
     spectrum: np.ndarray,
     args: argparse.Namespace,
 ) -> SiteDiagnostics:
-    """Generate and analyze all first-row correlators, cleaning up storage."""
+    """Generate and analyze the origin covariance row using temporary storage.
+
+    The memory map holds every retained field, while analysis loads only
+    ``iat_batch_size`` sites at a time. Temporary files are removed on exit,
+    including when sampling or analysis fails.
+    """
 
     storage_dtype = np.float64 if model.dtype == jnp.float64 else np.float32
     shape = (model.dimension, args.trajectory_samples)
@@ -498,9 +519,8 @@ def run_experiment(args: argparse.Namespace) -> DiagnosticsResult:
     )
     validate_lattice_model(model)
     root_key = random.PRNGKey(args.seed)
-    # A focused one-side invocation corresponds to side_index=0 in the old
-    # suite.  Retain its independent key tags for learning, reference, and
-    # the post-learning serial trajectory.
+    # Fixed key tags separate learning, reference, and diagnostic trajectories
+    # while retaining reproducibility with earlier single-side experiments.
     base_key = random.fold_in(root_key, 0)
     warmup_key = random.fold_in(base_key, 10_001)
     reference_key = random.fold_in(base_key, 10_003)
@@ -608,6 +628,7 @@ def make_figures(
             label="Short-chain estimate",
         )
 
+    # Summarize the sitewise scatter in unit-width periodic-distance bins.
     if np.any(finite):
         radial_bins = np.floor(distances[finite]).astype(int)
         unique_bins = np.unique(radial_bins)
@@ -685,6 +706,7 @@ def make_figures(
     site_reliable = diagnostics.site_field_autocorrelation_reliable & np.isfinite(
         diagnostics.site_mean_z_scores
     )
+    # Gray sites lack a reliable IAT estimate for standardizing the mean.
     displayed_z_scores = np.ma.masked_where(
         ~site_reliable,
         diagnostics.site_mean_z_scores,
@@ -883,7 +905,7 @@ def apply_quick_configuration(
     args: argparse.Namespace,
     explicit_destinations: set[str] | None = None,
 ) -> None:
-    """Apply the old quick diagnostic preset, preserving overrides."""
+    """Apply the reduced CPU diagnostic preset, preserving explicit options."""
 
     if not args.quick:
         return
@@ -912,7 +934,7 @@ def apply_gpu_configuration(
     args: argparse.Namespace,
     explicit_destinations: set[str] | None = None,
 ) -> None:
-    """Apply the prior opt-in GPU diagnostic settings."""
+    """Apply the GPU diagnostic preset, preserving explicit options."""
 
     if not args.gpu:
         return
