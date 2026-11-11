@@ -301,7 +301,10 @@ def validate_lattice_model(model: LatticeModel) -> None:
     spectrum_error = float(
         np.max(np.abs(numerical_spectrum - model.laplacian_spectrum))
     )
-    if spectrum_error > 20.0 * tolerance:
+    # FFT roundoff scales with the Laplacian coupling. An absolute tolerance
+    # rejects correct float32 spectra when beta is large (e.g. beta=10^4).
+    spectrum_scale = max(float(np.max(np.abs(model.laplacian_spectrum))), 1.0)
+    if spectrum_error > 20.0 * tolerance * spectrum_scale:
         raise AssertionError(
             f"Periodic Laplacian spectrum error is {spectrum_error:.3e}."
         )

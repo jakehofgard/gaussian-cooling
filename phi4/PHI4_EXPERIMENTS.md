@@ -46,6 +46,41 @@ python -m phi4.experiment_phi4_stage_convergence --radius inf \
 
 These options can be combined as needed.
 
+## Beta sweep at fixed relative conditioning
+
+[Beta sweep](experiment_phi4_beta_sweep.py) compares translation-invariant
+Gaussian cooling, translation-invariant empirical preconditioning, and
+translation-averaged ULMC on a side-100 lattice. It fixes $\lambda=0.5$, $R=2$,
+and $m=6$ and tests nine logarithmically spaced $\beta$ values from 1 to $10^4$.
+Thus $\alpha=1/2$ remains fixed while $\kappa=2+4\beta/3$ grows.
+
+```bash
+# Small local test
+python -m phi4.experiment_phi4_beta_sweep --quick \
+  --output-prefix results/phi4_beta_quick
+
+# Full GPU experiment
+python -m phi4.experiment_phi4_beta_sweep --gpu \
+  --output-prefix figures/phi4_beta_gpu
+```
+
+The defaults match the GPU stage-comparison budget: 512 chains, 256 steps per
+stage, 12 stages, and one repeat. Ordinary ULMC's step size decreases with
+$\beta$ for stability; all three methods retain the same gradient-evaluation
+budget. Use `--side`, `--betas`, or the standard budget options to customize
+the run. `--help` lists all controls.
+
+Outputs are `_beta_comparison_d100.pdf` (quality against the reference),
+`_beta_gff_comparison_d100.pdf` (comparison with $(\Delta_\beta+mI)^{-1}$),
+and one `_beta_stage_comparison_d100_beta{beta}.pdf` per beta, using the
+existing method-comparison plotting conventions. Numerical results are saved
+in `_beta_sweep_d100_data.npz` and `_beta_sweep_d100_summary.csv`.
+
+For assessing collapse to a Gaussian as $\beta$ grows too large, check a longer reference run by adding
+`--reference-steps 10000 --reference-chains 8192`. The default reference is
+short, and a relative condition number near one can hide an overall variance
+mismatch.
+
 ## Mixing and autocorrelation
 
 [Diagnostics](experiment_phi4_diagnostics.py) first learns a covariance with Gaussian cooling, then uses it to run a sampling chain. It measures integrated autocorrelation time (IAT). It also checks whether the estimated field mean at each site is consistent with the model's zero mean.
@@ -146,14 +181,14 @@ python -m phi4 --only scaling --only stages --quick \
 ```
 
 The available names are `scaling`, `stages`, `diagnostics`, `correlator`,
-`sweeps`, `hardness`, and `budget`. Hardness maps and budget studies run only
-when selected. Use the individual scripts when changing target parameters
+`sweeps`, `hardness`, `budget`, and `beta`. Hardness maps, budget studies, and
+beta sweeps run only when selected. Use the individual scripts when changing target parameters
 or sampling budgets.
 
 GPU runs require JAX to recognize an available GPU. `python -m phi4 --gpu`
 runs scaling and stages only: sides 64, 128, 256, and 512 for scaling, and
 sides 256 and 512 for stages. Diagnostics and correlators have their own GPU
-presets when run individually. Hardness and budget studies use `--gpu` only
+presets when run individually. Hardness, budget, and beta studies use `--gpu` only
 to require a GPU. Parameter sweeps have no `--gpu` flag. `--quick` and `--gpu`
 cannot be combined.
 
