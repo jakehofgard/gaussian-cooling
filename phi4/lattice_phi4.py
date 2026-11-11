@@ -101,12 +101,13 @@ class LatticeModel:
 def _periodic_laplacian(field: Array, beta: float) -> Array:
     """Apply the weighted nearest-neighbor Laplacian on a square torus."""
 
+    # Form differences first: 4*field - sum(neighbors) can leave roundoff
+    # even on a constant field, which large beta amplifies into a false force.
+    vertical = field - jnp.roll(field, 1, axis=0)
+    horizontal = field - jnp.roll(field, 1, axis=1)
     return beta * (
-        4.0 * field
-        - jnp.roll(field, 1, axis=0)
-        - jnp.roll(field, -1, axis=0)
-        - jnp.roll(field, 1, axis=1)
-        - jnp.roll(field, -1, axis=1)
+        vertical - jnp.roll(vertical, -1, axis=0)
+        + horizontal - jnp.roll(horizontal, -1, axis=1)
     )
 
 

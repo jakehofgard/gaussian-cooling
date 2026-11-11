@@ -1,6 +1,6 @@
 r"""Fixed-alpha, increasing-kappa lattice phi4 comparison on CPU or GPU.
 
-The target fixes lambda=.5, R=2 and m=6 and sweeps the Laplacian coupling.
+The target fixes lambda=.5, R=.1 and m=.01 and sweeps the Laplacian coupling.
 All covariances stay in Fourier form: no D-by-D matrix is constructed.
 The GPU stage-comparison budget is retained; only ordinary ULMC's step is
 capped as requested to avoid frozen-force integrator instability.
@@ -57,8 +57,8 @@ from matplotlib.ticker import NullFormatter
 
 
 QUARTIC = 0.5
-MASS = 6.0
-RADIUS = 2.0
+MASS = 0.01
+RADIUS = 0.1
 DEFAULT_BETAS = (1.0, 10.0, 100.0, 1_000.0, 10_000.0, 100_000.0)
 
 
@@ -379,7 +379,8 @@ def save_beta_sweep_data(result: BetaSweepResult, args: argparse.Namespace) -> t
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Sweep beta with lambda=.5, R=2, m=6 and the GPU comparison budget.",
+        description=(f"Sweep beta with lambda={QUARTIC:g}, R={RADIUS:g}, "
+                     f"m={MASS:g} and the GPU comparison budget."),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--side", type=int, default=100)
@@ -431,7 +432,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         parser.error(str(exc))
     calibration = reference_gff_variance_calibration(args)
     print(f"Backend: {jax.default_backend()}; devices: {jax.devices()}", flush=True)
-    print("Fixed lambda=.5, R=2, m=6; alpha=.5. Equal gradient budgets; "
+    alpha = MASS / (MASS + 3 * QUARTIC * RADIUS**2)
+    print(f"Fixed lambda={QUARTIC:g}, R={RADIUS:g}, m={MASS:g}; alpha={alpha:g}. "
+          "Equal gradient budgets; "
           "ordinary ULMC uses h=min(h_requested, factor*friction/L).", flush=True)
     print(f"Reference harmonic variance calibration: {calibration:.6g} (equilibrium=1). "
           "GFF comparisons are finite-sample covariance diagnostics, not a Gaussianity certificate.", flush=True)

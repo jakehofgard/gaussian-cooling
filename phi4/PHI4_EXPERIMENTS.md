@@ -50,9 +50,9 @@ These options can be combined as needed.
 
 [Beta sweep](experiment_phi4_beta_sweep.py) compares translation-invariant
 Gaussian cooling, translation-invariant empirical preconditioning, and
-translation-averaged ULMC on a side-100 lattice. It fixes $\lambda=0.5$, $R=2$,
-and $m=6$ and tests $\beta=1,10,100,1000,10000,100000$.
-Thus $\alpha=1/2$ remains fixed while $\kappa=2+4\beta/3$ grows.
+translation-averaged ULMC on a side-100 lattice. It fixes $\lambda=0.5$, $R=0.1$,
+and $m=0.01$ and tests $\beta=1,10,100,1000,10000,100000$.
+Thus $\alpha=0.4$ remains fixed while $\kappa=800\beta+2.5$ grows.
 
 ```bash
 # Small local test
