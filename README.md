@@ -7,10 +7,6 @@ There are two groups of experiments, corresponding to Sections 4.1 and 4.2 in th
 - **Transformed Gaussians:** well-conditioned Gaussians under a random, ill-conditioned linear map (Section 4.1).
 - **Lattice $\phi^4$:** a simplified lattice field theory, with a quartic term (Section 4.2). See the [lattice experiment guide](phi4/PHI4_EXPERIMENTS.md) for a list of experiments and explanations of the figures present in the paper.
 
-The [fixed-relative-conditioning beta sweep](phi4/PHI4_EXPERIMENTS.md#beta-sweep-at-fixed-relative-conditioning)
-compares the three translation-invariant methods on a side-100 lattice for
-$\lambda=0.5$, $R=0.1$, $m=0.01$, and $\beta\in\{1,10,100,1000,10000,100000\}$.
-
 ## Installation
 
 Run the commands below from the project directory:
