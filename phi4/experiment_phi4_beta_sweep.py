@@ -45,7 +45,6 @@ from .phi4_cli import (
     validate_common_arguments,
 )
 from .phi4_plotting import (
-    GRAY,
     METHOD_STYLES,
     PLOT_LABELS,
     _configure_plot_style,
@@ -60,7 +59,7 @@ from matplotlib.ticker import NullFormatter
 QUARTIC = 0.5
 MASS = 6.0
 RADIUS = 2.0
-DEFAULT_BETAS = tuple(np.logspace(0.0, 4.0, 9))
+DEFAULT_BETAS = (1.0, 10.0, 100.0, 1_000.0, 10_000.0, 100_000.0)
 
 
 @dataclass
@@ -289,8 +288,10 @@ def make_beta_figures(result: BetaSweepResult, args: argparse.Namespace) -> dict
         rf";\ n={args.chains},\ N={args.steps},\ K={args.stages}$"
     )
     for name, metrics, title in (
-        ("beta_comparison", result.relative_conditions, "Preconditioner quality across coupling"),
-        ("beta_gff_comparison", result.gff_relative_conditions, "Covariance comparison with the Gaussian free field"),
+        ("beta_comparison", result.relative_conditions,
+         r"Preconditioner quality vs. $\beta$"),
+        ("beta_gff_comparison", result.gff_relative_conditions,
+         r"Relative condition number $\kappa_{\mathrm{rel}}$ vs. $\beta$"),
     ):
         figure, ax = plt.subplots(figsize=(6.5, 4.9), constrained_layout=True)
         for method_index, method in enumerate(SCALABLE_METHODS):
@@ -307,16 +308,17 @@ def make_beta_figures(result: BetaSweepResult, args: argparse.Namespace) -> dict
                         marker=marker, linestyle=linestyle,
                         label=PLOT_LABELS[method] if segment_index == 0 else "_nolegend_",
                     )
-        if name == "beta_gff_comparison":
-            ax.plot(result.betas, result.reference_gff_conditions, color=GRAY,
-                    marker="x", linestyle=":", label="Independent reference covariance")
         ax.axhline(1.0, color="#222222", linestyle=":", linewidth=0.9)
         ax.set_xscale("log")
         ax.set_yscale("log")
         ax.set_xticks(result.betas, [f"{beta:g}" for beta in result.betas])
         ax.xaxis.set_minor_formatter(NullFormatter())
         ax.set_xlabel(r"Laplacian coupling $\beta$")
-        ax.set_ylabel(r"Relative condition number $\kappa_{\mathrm{rel}}$")
+        ax.set_ylabel(
+            r"$\kappa_{\mathrm{rel}}(M_\beta^{-1},\widehat\Sigma)$"
+            if name == "beta_gff_comparison"
+            else r"Relative condition number $\kappa_{\mathrm{rel}}$"
+        )
         ax.set_title(title + "\n" + subtitle)
         ax.grid(which="major", color="#D8D8D8", linewidth=0.55, alpha=0.8)
         ax.legend(frameon=False, loc="upper center", bbox_to_anchor=(0.5, -0.24),
@@ -391,7 +393,11 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Ordinary ULMC h cap is this factor times friction/L; must be in (0,1].")
     add_reference_arguments(parser)
     add_execution_arguments(parser, default_output=Path(__file__).resolve().parents[1] / "figures" / "phi4_beta")
-    parser.set_defaults(reference_step_size=.001)
+    parser.set_defaults(
+        reference_chains=2048,
+        reference_steps=2048,
+        reference_step_size=.001,
+    )
     return parser
 
 
@@ -431,8 +437,8 @@ def main(argv: Sequence[str] | None = None) -> None:
           "GFF comparisons are finite-sample covariance diagnostics, not a Gaussianity certificate.", flush=True)
     if abs(calibration - 1.) > .05:
         warnings.warn("The reference budget has appreciable harmonic transient/step-size bias. "
-                      "For collapse analysis, check convergence with --reference-steps 10000 "
-                      "and more reference chains; see PHI4_EXPERIMENTS.md.", RuntimeWarning)
+                      "For collapse analysis, check convergence with longer reference runs "
+                      "and more reference chains.", RuntimeWarning)
     result = run_beta_sweep(args)
     data_path, csv_path = save_beta_sweep_data(result, args)
     figures = make_beta_figures(result, args)

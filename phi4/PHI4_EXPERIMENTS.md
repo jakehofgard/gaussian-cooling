@@ -51,7 +51,7 @@ These options can be combined as needed.
 [Beta sweep](experiment_phi4_beta_sweep.py) compares translation-invariant
 Gaussian cooling, translation-invariant empirical preconditioning, and
 translation-averaged ULMC on a side-100 lattice. It fixes $\lambda=0.5$, $R=2$,
-and $m=6$ and tests nine logarithmically spaced $\beta$ values from 1 to $10^4$.
+and $m=6$ and tests $\beta=1,10,100,1000,10000,100000$.
 Thus $\alpha=1/2$ remains fixed while $\kappa=2+4\beta/3$ grows.
 
 ```bash
@@ -64,8 +64,9 @@ python -m phi4.experiment_phi4_beta_sweep --gpu \
   --output-prefix figures/phi4_beta_gpu
 ```
 
-The defaults match the GPU stage-comparison budget: 512 chains, 256 steps per
-stage, 12 stages, and one repeat. Ordinary ULMC's step size decreases with
+The method defaults match the GPU stage-comparison budget: 512 chains, 256
+steps per stage, 12 stages, and one repeat. The reference uses 2,048 chains,
+2,048 steps, and step size $h=0.001$. Ordinary ULMC's step size decreases with
 $\beta$ for stability; all three methods retain the same gradient-evaluation
 budget. Use `--side`, `--betas`, or the standard budget options to customize
 the run. `--help` lists all controls.
@@ -76,10 +77,12 @@ and one `_beta_stage_comparison_d100_beta{beta}.pdf` per beta, using the
 existing method-comparison plotting conventions. Numerical results are saved
 in `_beta_sweep_d100_data.npz` and `_beta_sweep_d100_summary.csv`.
 
-For assessing collapse to a Gaussian as $\beta$ grows too large, check a longer reference run by adding
-`--reference-steps 10000 --reference-chains 8192`. The default reference is
-short, and a relative condition number near one can hide an overall variance
-mismatch.
+The reference estimates the full $\phi^4$ covariance using a separate sampler
+preconditioned by $M_\beta^{-1}$. The GFF plot compares the three methods'
+covariance estimates with the exact $M_\beta^{-1}$. Values near one indicate
+proportional covariance spectra; they do not establish Gaussianity. Check
+the saved GFF-relative eigenvalue ranges for variance mismatches and account
+for sampling error before interpreting agreement with the GFF.
 
 ## Mixing and autocorrelation
 

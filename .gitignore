@@ -10,6 +10,9 @@ venv/
 .mypy_cache/
 .ruff_cache/
 
+# Local experiment validation
+/tests/
+
 # Generated experiment output
 figures/
 results/

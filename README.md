@@ -9,7 +9,7 @@ There are two groups of experiments, corresponding to Sections 4.1 and 4.2 in th
 
 The [fixed-relative-conditioning beta sweep](phi4/PHI4_EXPERIMENTS.md#beta-sweep-at-fixed-relative-conditioning)
 compares the three translation-invariant methods on a side-100 lattice for
-$\lambda=0.5$, $R=2$, $m=6$, and $1\leq\beta\leq10^4$.
+$\lambda=0.5$, $R=2$, $m=6$, and $\beta\in\{1,10,100,1000,10000,100000\}$.
 
 ## Installation
 
